@@ -1,0 +1,15 @@
+[theme]
+base = "light"
+primaryColor = "#3582F0"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f7fa"
+textColor = "#111827"
+font = "sans serif"
+
+[server]
+# No file watching: Streamlit creates a watcher per browser session, and with a full class that polling eats the
+# server's CPU (seen in the TV Dialogue Lab load test). After pushing code changes, reboot the app on Streamlit Cloud.
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false

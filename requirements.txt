@@ -1,0 +1,6 @@
+# What the deployed app needs. build_data.py also needs scikit-learn and statsmodels, but only run it locally.
+streamlit>=1.59
+pandas>=2.2
+numpy>=1.26
+altair>=5.3
+huggingface_hub>=0.23
