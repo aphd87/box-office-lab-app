@@ -122,6 +122,7 @@ DEFINE_RULES = [
     ("followed by a gain", "Share of releases after which the parent's stock beat the market over the next 5 days."),
     ("tone", "How upbeat executives sounded on the parent's quarterly earnings call, scored by FinBERT: share of "
              "positive minus negative sentences (−1 to +1)."),
+    ("% of parent", "The film's worldwide box office ÷ its parent company's total revenue for the fiscal year."),
     ("roa", "Return on assets: the parent company's net income ÷ total assets for the quarter."),
     ("margin", "Profit margin: the parent company's net income ÷ revenue."),
     ("leverage", "Debt ÷ total assets of the parent company."),
@@ -593,6 +594,11 @@ def render_profile(r):
                             "positive minus negative sentences (−1 to +1).")
         cols[2].metric("Parent ROA (quarter)", fmt(r["during_roa"] * 100 if pd.notna(r["during_roa"]) else np.nan, "{:.2f}%"),
                        help="Net income ÷ total assets in the release quarter.")
+        if isinstance(r.get("parent"), str):
+            share = r.get("film_share_parent")
+            st.caption(f"Parent at release: **{r['parent']}**"
+                       + (f" · annual revenue {money(r['parent_rev_fy'] * 1e6)}; this film's worldwide gross = "
+                          f"{share * 100:.2f}% of it" if pd.notna(share) else ""))
         if pd.isna(r["during_roa"]):
             st.caption("*Quarterly financials and earnings-call tone aren't available for this film; they cover about a "
                        "third of the films, mostly releases by publicly traded parents since the mid-2000s.*")
@@ -1274,11 +1280,12 @@ def ci_bars(d, order, colors, ytitle):
 
 
 PARENT_METRICS = {  # label: (parents.json column, unit, how it's computed)
+    "Revenue": ("Revenue", "$B per year", "total revenue over the fiscal year"),
     "Profit margin": ("Margin", "%", "net income ÷ revenue"),
     "ROA": ("ROA", "% per quarter", "net income ÷ total assets"),
     "Leverage": ("Leverage", "%", "debt ÷ total assets"),
 }
-PARENT_FILM_COL = {"Profit margin": "margin", "ROA": "roa", "Leverage": "leverage"}
+PARENT_FILM_COL = {"Revenue": "margin", "Profit margin": "margin", "ROA": "roa", "Leverage": "leverage"}
 
 
 @st.fragment
@@ -1359,32 +1366,46 @@ def wallstreet_section():
     exhibit("How healthy were the parent companies?")
     metric = st.radio("Measure", list(PARENT_METRICS), horizontal=True, key="ws_metric")
     col, unit, how = PARENT_METRICS[metric]
-    pa = PARENTS.groupby(["Studio", "Year"], as_index=False)[col].mean()
-    pa["Value"] = pa[col] * 100
+    if metric == "Revenue":   # calendar years with all four quarters from the same owner, summed
+        pa = (PARENTS.dropna(subset=["Revenue"]).groupby(["Studio", "Year", "Parent"])["Revenue"]
+              .agg(["sum", "count"]).reset_index())
+        pa = pa[pa["count"] == 4].assign(Value=lambda x: x["sum"] / 1e3)
+    else:
+        pa = PARENTS.groupby(["Studio", "Year"], as_index=False).agg(Value=(col, "mean"), Parent=("Parent", "last"))
+        pa["Value"] = pa["Value"] * 100
     pick = [x for x in STUDIOS if x in set(pa["Studio"])]
     recent = pa[pa["Year"] >= pa["Year"].max() - 4].groupby("Studio")["Value"].mean()
     lead = recent.idxmin() if metric == "Leverage" else recent.idxmax()
-    best = "lowest leverage" if metric == "Leverage" else f"highest {metric.lower() if metric != 'ROA' else 'ROA'}"
+    best = ("lowest leverage" if metric == "Leverage" else "largest revenue" if metric == "Revenue"
+            else f"highest {metric.lower() if metric != 'ROA' else 'ROA'}")
     lo, hi = pa["Value"].quantile([0.04, 0.96])
     pad = (hi - lo) * 0.15
+    pct = "" if metric == "Revenue" else "%"
+    money_unit = "$" if metric == "Revenue" else ""
     show_chart(studio_lines(pa, alt.X("Year:Q", title=None, axis=alt.Axis(format="d")),
                             alt.Y("Value:Q", title=f"{metric} ({unit})",
-                                  scale=alt.Scale(domain=[float(lo - pad), float(hi + pad)], clamp=True)), pick,
-                            ["Studio", "Year", alt.Tooltip("Value:Q", format=".2f", title=f"{metric} ({unit})")])
+                                  scale=alt.Scale(domain=[float(max(lo - pad, 0) if metric == "Revenue" else lo - pad),
+                                                          float(hi + pad)], clamp=True)), pick,
+                            ["Studio", "Parent", alt.Tooltip("Year:Q", format="d", title="Fiscal year"),
+                             alt.Tooltip("Value:Q", format=".2f", title=f"{metric} ({unit})")])
                .properties(height=330),
-               f"Last five years: {lead}'s parent had the {best} ({recent[lead]:.1f}%)"
-               + ("" if lead == "Universal" else f"; Universal's {recent.get('Universal', np.nan):.1f}%"),
-               f"Parent company's {metric if metric == 'ROA' else metric.lower()} by year (average of its fiscal "
-               f"quarters): {how}")
-    st.caption("*Each line is the whole parent company (Comcast for Universal, Disney, Warner Bros. Discovery, Sony, "
-               "Paramount, Fox, Lionsgate), so film is one business among many: cable, parks, TV networks, streaming, "
-               "electronics. Years without a film in the data have no point. A few extreme years (2008 write-downs, Fox's "
-               "2019 gain from its sale to Disney) are pinned to the chart's edge so the other years stay readable; "
-               "hover for the true value. Dollar levels aren't shown because the "
-               "source file's revenue and income figures are on inconsistent scales; the ratios aren't affected. "
-               "Source: Compustat quarterly.*")
+               f"Last five years: {lead}'s parent had the {best} ({money_unit}{recent[lead]:.1f}{pct}"
+               f"{'B' if metric == 'Revenue' else ''})"
+               + ("" if lead == "Universal" else
+                  f"; Universal's {money_unit}{recent.get('Universal', np.nan):.1f}{pct}{'B' if metric == 'Revenue' else ''}"),
+               f"Parent company's {metric if metric == 'ROA' else metric.lower()} by year "
+               f"({'sum of the four quarters' if metric == 'Revenue' else 'average of its quarters'}): {how}")
+    st.caption("*Each line is the company that owned the studio at the time (hover for its name): GE, then Comcast, "
+               "for Universal; Time Warner, AT&T, then Warner Bros. Discovery for Warner; Viacom, then Paramount Global "
+               "for Paramount; 21st Century Fox; Disney; Lionsgate; Sony Group. So film is one business among many: "
+               "cable, parks, TV networks, streaming, wireless, electronics. A few extreme years (2008 write-downs, "
+               "one-off gains) are pinned to the chart's edge so the others stay readable; hover for the true value. "
+               "Sources: SEC 10-Q/10-K filings from 2008; earlier years and Sony from Compustat (ratios only, so no "
+               "revenue line for them).*")
 
     exhibit("Did the parent's results change after a hit?")
+    if metric == "Revenue":
+        metric, unit = "Profit margin", "%"
     recs = []
     for name, g in [("Hits (top 25% return)", hits), ("Misses (bottom 25% return)", misses)]:
         for t, lab in [("prior", "Quarter before release"), ("during", "Release quarter"), ("post", "Quarter after")]:
@@ -1413,6 +1434,33 @@ def wallstreet_section():
                    "the usual result, because one film rarely moves a conglomerate's quarter.*")
     else:
         st.info("Too few films with parent financials for this studio to compare hits and misses.")
+
+    exhibit("How big is one film next to its parent?")
+    fs = d.dropna(subset=["film_share_parent"]).copy()
+    fs["Share"] = fs["film_share_parent"] * 100
+    if len(fs) >= 10:
+        med = fs["Share"].median()
+        topf = fs.loc[fs["Share"].idxmax()]
+        by = fs.groupby("studio")["Share"].median().reindex(STUDIOS).dropna()
+        bars = alt.Chart(by.reset_index().rename(columns={"studio": "Studio", "Share": "Median"})).mark_bar(
+            cornerRadiusEnd=3, stroke="white", strokeWidth=0.8).encode(
+            x=alt.X("Studio:N", sort=list(by.index), title=None,
+                    axis=alt.Axis(labelAngle=0, labelColor=studio_expr("value"), labelFontWeight=600)),
+            y=alt.Y("Median:Q", title="Film's worldwide gross as % of parent's annual revenue"),
+            color=alt.Color("Studio:N", scale=alt.Scale(domain=list(by.index),
+                                                        range=[STUDIO_COLOR[x] for x in by.index]), legend=None),
+            stroke=alt.condition("datum.Studio == 'Paramount'", alt.value(KEYLINE), alt.value("white")),
+            tooltip=["Studio", alt.Tooltip("Median:Q", format=".2f", title="Median % of parent revenue")])
+        show_chart(bars.properties(height=260),
+                   f"The typical film grosses {med:.2f}% of its parent's annual revenue; the biggest here, "
+                   f"{topf['title']}, {topf['Share']:.1f}%",
+                   f"{stu}: worldwide box office ÷ the parent's revenue in the release fiscal year, median by studio")
+        st.caption("*Box office isn't revenue (theaters keep about half), so the film's real weight is smaller still. "
+                   "This is why one film rarely moves a conglomerate's stock or its quarter, and why Lionsgate, the "
+                   "only near-pure film company here, is the place to look for film-driven swings. SEC filings, "
+                   "fiscal years with all four quarters reported.*")
+    else:
+        st.info("Too few films with parent revenue for this selection.")
 
     exhibit("Biggest stock reactions")
     cols = st.columns(2)
