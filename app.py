@@ -586,10 +586,11 @@ def render_profile(r):
 
         st.markdown("**The parent company around the release**")
         cols = st.columns(3)
-        cols[0].metric("Stock reaction, 5 days", fmt(r["car5"] * 100 if pd.notna(r["car5"]) else np.nan, "{:+.1f}%"),
+        na = "N/A" if isinstance(r.get("wrong_parent_note"), str) else "—"
+        cols[0].metric("Stock reaction, 5 days", fmt(r["car5"] * 100 if pd.notna(r["car5"]) else np.nan, "{:+.1f}%", na),
                        help="Parent company's stock return beyond the market's, from release day to 5 trading days "
                             "later (cumulative abnormal return).")
-        cols[1].metric("Earnings-call tone", fmt(r["during_tone"], "{:+.2f}"),
+        cols[1].metric("Earnings-call tone", fmt(r["during_tone"], "{:+.2f}", na),
                        help="Tone of the parent's earnings call in the release quarter, scored by FinBERT: share of "
                             "positive minus negative sentences (−1 to +1).")
         cols[2].metric("Parent ROA (quarter)", fmt(r["during_roa"] * 100 if pd.notna(r["during_roa"]) else np.nan, "{:.2f}%"),
@@ -599,6 +600,8 @@ def render_profile(r):
             st.caption(f"Parent at release: **{r['parent']}**"
                        + (f" · annual revenue {money(r['parent_rev_fy'] * 1e6)}; this film's worldwide gross = "
                           f"{share * 100:.2f}% of it" if pd.notna(share) else ""))
+        if na == "N/A":
+            st.caption(f"*{r['wrong_parent_note']}*")
         if pd.isna(r["during_roa"]):
             st.caption("*Quarterly financials and earnings-call tone aren't available for this film; they cover about a "
                        "third of the films, mostly releases by publicly traded parents since the mid-2000s.*")
@@ -1295,7 +1298,8 @@ def wallstreet_section():
             "ask whether investors noticed a film. The **stock reaction** is the parent's return beyond the overall "
             "market's from release day to five trading days later (a cumulative abnormal return). The **earnings-call "
             "tone** is how upbeat executives sounded on the quarter's call, scored by FinBERT, a finance-tuned "
-            "language model.")
+            "language model. Paramount 2006–2019 and Universal before 2011 are N/A: the source data measured them on "
+            "CBS and Comcast, which didn't own those studios then (Viacom and GE did).")
     c1, c2 = st.columns([1, 3])
     stu = c1.selectbox("Studio", ["All studios"] + STUDIOS, key="ws_studio")
     d = FILMS if stu == "All studios" else FILMS[FILMS["studio"] == stu]
