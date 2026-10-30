@@ -236,7 +236,7 @@ PANEL, SOFT = "#eaeaf2", "#9aa3b2"     # seaborn "darkgrid": gray-blue panel, wh
 
 def show_chart(chart, title=None, subtitle=None, panel=True):
     """House style for every chart, after seaborn's darkgrid: a soft gray-blue panel with white gridlines, no axis
-    lines or ticks. The heading names the measure (subtitle); the insight (title) goes in a takeaway box under the
+    lines or ticks. The heading names the measure (subtitle); the insight (title) goes in an Insight box under the
     chart, so every chart ends with its answer. Heatmaps pass panel=False (white background, as in seaborn)."""
     if subtitle or title:
         chart = chart.properties(title=alt.TitleParams(text=subtitle or title, anchor="start"))
@@ -254,7 +254,7 @@ def show_chart(chart, title=None, subtitle=None, panel=True):
                                titleFontSize=11, titleColor=MUTED, columnPadding=14))
     st.altair_chart(chart, theme=None, **_stretch(st.altair_chart))
     if title and subtitle:
-        takeaway(f"<b>Answer:</b> {title}")
+        takeaway(f"<b>Insight:</b> {title}")
 
 
 def section(kicker, title, how):
