@@ -24,7 +24,8 @@ import streamlit as st
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "data"
 
-st.set_page_config(page_title="Behind the Box Office Lab", page_icon="🎬", layout="wide")
+st.set_page_config(page_title="Behind the Box Office Lab", page_icon="🎬", layout="wide",
+                   initial_sidebar_state="collapsed")
 
 # --- Design system ---------------------------------------------------------------------------------------------
 BLUE, INK, GRAY, MUTED = "#3582F0", "#111827", "#9ca3af", "#6b7280"
@@ -59,6 +60,117 @@ MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", 
 SEASON_ORDER = ["Winter", "Spring", "Summer", "Fall", "Holiday"]
 HIT_MULTIPLE = 2.5
 
+# One long page: section title -> anchor. Order here is the order on the page and in the menus.
+NAV = {"Studio Playbooks": "studios", "Trends & Franchise Fatigue": "trends", "Script DNA": "scripts",
+       "Film Economics": "economics", "Pitch a Film": "pitch", "Wall Street & Parent Companies": "parents",
+       "Predict the Box Office": "predict", "Movie Database": "database"}
+NAV_NUM = {t: str(i) for i, t in enumerate(NAV, start=1)}
+
+
+# --- Definitions on hover ---------------------------------------------------------------------------------------
+# Every stat tile and table column gets a hover definition looked up from its label, so a new measure only needs a
+# rule here. Rules are checked in order (first match wins), so specific phrases come before general ones.
+DEFINE_RULES = [
+    ("films in this dataset", "How many of the studio's films are in this dataset (films whose scripts were "
+                              "available), not its full slate."),
+    ("number of films", "How many films in this dataset fall in the group."),
+    ("films with stock data", "Films whose parent company was publicly traded at release, so a stock reaction "
+                              "can be measured."),
+    ("hit rate", f"Share of films grossing at least {HIT_MULTIPLE}× their production budget worldwide, roughly the "
+                 f"level where a film turns a profit after marketing and the theaters' cut."),
+    ("profitable", "Share of films whose estimated studio profit (from the deal assumptions in Film Economics) is "
+                   "above zero."),
+    ("break-even", "The worldwide box office, as a multiple of the production budget, a film needs before the "
+                   "studio's share covers the budget and the marketing."),
+    ("chance of a profit", "Share of the model's past prediction misses that would still leave this film above "
+                           "break-even."),
+    ("10th–90th", "The range from a bad case (only 1 film in 10 did worse) to a good case (only 1 in 10 did better)."),
+    ("profit", "Estimated studio profit: the studio's share of ticket sales, minus production budget and marketing, "
+               "plus the later windows if included. Uses the deal assumptions in Film Economics."),
+    ("return", "Worldwide box office ÷ production budget (the gross multiple). 1× = the gross only matched the "
+               "budget; roughly 2.5–3× is needed to profit once theaters and marketing take their share."),
+    ("week-2 drop", "% of the first week's US gross lost in the second week. Higher = more front-loaded, often a "
+                    "sign of weak word of mouth or a fan-driven opening."),
+    ("week 1 share", "Share of the total US gross earned in the first 7 days: how front-loaded the run was."),
+    ("predicted", "The model's median prediction of worldwide box office for these choices."),
+    ("likely range", "The middle 50% of outcomes: half of comparable past films landed inside this range."),
+    ("needed", "Worldwide gross needed to cover budget and marketing over the full release cycle."),
+    ("opening theaters", "Number of US theaters showing the film on opening weekend. 600+ counts as a wide release."),
+    ("theaters", "Number of US theaters showing the film on opening weekend."),
+    ("opening", "US and Canada box office from the first Friday–Sunday of release (nominal dollars)."),
+    ("worldwide", "Total box office: US and Canada plus international, in nominal dollars (not adjusted for "
+                  "inflation)."),
+    ("domestic", "US and Canada box office, in nominal dollars."),
+    ("international", "Box office outside the US and Canada, in nominal dollars."),
+    ("budget", "Production budget: what it cost to make the film, excluding marketing (nominal dollars, as "
+               "reported by The Numbers or TMDB)."),
+    ("imdb", "Average IMDb user rating, 1–10."),
+    ("metascore", "Metacritic's weighted average of professional critics' reviews, 0–100."),
+    ("follow-up", "A sequel, prequel, reboot, remake or shared-universe spin-off of an earlier film. Adaptations of "
+                  "TV shows, games, comics or books count as originals."),
+    ("original", "A film that isn't a sequel, prequel, reboot, remake or spin-off of an earlier film."),
+    ("weeks in the top 10", "Weeks the film ranked in the US weekly top 10."),
+    ("weeks in release", "Weeks the film played in US theaters."),
+    ("years as #1", "Years the studio had the largest share of the US box office."),
+    ("led us share", "Years (1995–2023) Universal had the largest share of the US box office, all releases."),
+    ("explained by the data", "Share of the differences in worldwide box office between films that a model can "
+                              "predict on films it never saw (cross-validated R²)."),
+    ("stock reaction", "The parent company's stock return beyond the overall market's, from release day to 5 trading "
+                       "days later (cumulative abnormal return)."),
+    ("5-day reaction", "The parent company's stock return beyond the overall market's, from release day to 5 trading "
+                       "days later (cumulative abnormal return)."),
+    ("followed by a gain", "Share of releases after which the parent's stock beat the market over the next 5 days."),
+    ("tone", "How upbeat executives sounded on the parent's quarterly earnings call, scored by FinBERT: share of "
+             "positive minus negative sentences (−1 to +1)."),
+    ("roa", "Return on assets: the parent company's net income ÷ total assets for the quarter."),
+    ("margin", "Profit margin: the parent company's net income ÷ revenue."),
+    ("leverage", "Debt ÷ total assets of the parent company."),
+    ("r²", "Share of the variation in the outcome the model explains on films it never saw: 1 = perfect, 0 = no "
+           "better than guessing the average."),
+    ("p-value", "How surprising this result would be if the feature had no real relationship with the outcome. "
+                "Below 0.10 is flagged as significant here."),
+    ("importance", "How much the random forest's predictions rely on this feature (all features sum to 1)."),
+    ("effect", "Change in the outcome for a one-step increase in the feature (one standard deviation for "
+               "continuous features; yes vs. no for 0/1 features), holding the others constant."),
+    ("vif", "Variance inflation factor: how much a feature duplicates the others. Above 10 = removed."),
+    ("studio", "The major studio group that distributed the film (labels such as Focus or New Line count under "
+               "their parent studio)."),
+    ("genre", "The film's primary genre (TMDB). Genres with fewer than 20 films are grouped as Other."),
+    ("rating", "MPAA rating: G, PG, PG-13 or R."),
+    ("runtime", "Running time in minutes."),
+    ("director", "The film's credited director."),
+    ("lead cast", "The top-billed cast members."),
+    ("year", "Year of US release."),
+    ("films", "Number of films in the group (in this dataset)."),
+]
+
+
+def define(label):
+    """Hover definition for a measure's label, or None. 'Median ...' labels say so."""
+    low = str(label).lower()
+    for key, text in DEFINE_RULES:
+        if key in low:
+            if low.startswith("median") or "· follow-up vs. original" in low:
+                text = "Median = the middle film (half above, half below), which ignores a few huge outliers. " + text
+            return text
+    return None
+
+
+def measure_help(names):
+    """Help text for a 'Measure' picker: every option with its definition."""
+    return "  \n".join(f"**{n}**: {define(n) or ''}" for n in names)
+
+
+# Default every st.metric's hover help to the label's definition (an explicit help= still wins).
+_metric = st.delta_generator.DeltaGenerator.metric
+
+
+def _metric_with_help(self, label, value, *args, help=None, **kw):
+    return _metric(self, label, value, *args, help=help or define(label), **kw)
+
+
+st.delta_generator.DeltaGenerator.metric = _metric_with_help
+
 st.markdown(f"""<style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 html, body, [class*="st-"], .stMarkdown, .stCaption, button, input, textarea {{ font-family: {FONT}; }}
@@ -72,9 +184,20 @@ h2, h3, h4 {{ font-weight: 650 !important; letter-spacing: -0.015em; color: {INK
                             border-radius: 4px; padding: .7rem .9rem; }}
 [data-testid="stMetricLabel"] p {{ text-transform: uppercase; letter-spacing: .05em; font-size: .7rem !important;
                                    color: {MUTED}; font-weight: 600; }}
-[data-testid="stMetricValue"] {{ font-size: 1.45rem !important; font-weight: 650; color: {INK}; }}
+[data-testid="stMetricValue"] {{ font-size: 1.35rem !important; font-weight: 650; color: {INK}; }}
+[data-testid="stMetricLabel"] *, [data-testid="stMetricValue"] * {{ white-space: normal !important;
+    overflow: visible !important; text-overflow: clip !important; line-height: 1.25; }}
 .stTabs [data-baseweb="tab-list"] {{ gap: 1.4rem; border-bottom: 1px solid #e5e7eb; }}
 .stTabs [data-baseweb="tab"] p {{ font-weight: 600; font-size: .95rem; }}
+.chapter {{ border-top: 2px solid {INK}; margin: 3.2rem 0 1.1rem; }}
+.navbar {{ display: flex; flex-wrap: wrap; gap: .45rem; margin: .6rem 0 1.4rem; }}
+.navbar a {{ text-decoration: none; font-size: .82rem; font-weight: 600; color: {INK}; border: 1px solid #e5e7eb;
+             border-radius: 999px; padding: .28rem .8rem; background: #fff; }}
+.navbar a:hover {{ border-color: {BLUE}; color: {BLUE}; }}
+.navbar a b {{ color: {BLUE}; margin-right: .3rem; }}
+section[data-testid="stSidebar"] a {{ text-decoration: none; color: {INK}; }}
+[data-testid="stIconMaterial"], .material-symbols-rounded, [class*="material-symbols"] {{
+    font-family: 'Material Symbols Rounded' !important; }}
 [data-testid="stCaptionContainer"] p, .stCaption p {{ color: {MUTED}; }}
 .takeaway {{ border-left: 3px solid {BLUE}; background: #f5f9ff; padding: .75rem 1rem; margin: .4rem 0 1rem;
              color: {INK}; border-radius: 0 4px 4px 0; }}
@@ -90,8 +213,21 @@ def _stretch(fn):
         else {"use_container_width": True}
 
 
-def show_table(df, **kw):
-    st.dataframe(df, hide_index=True, **_stretch(st.dataframe), **kw)
+def show_table(df, column_config=None, **kw):
+    """st.dataframe in house style, with each column header's hover help filled in from define()."""
+    cfg = dict(column_config or {})
+    cols = df.data.columns if hasattr(df, "data") else df.columns
+    for c in cols:
+        v = cfg.get(c)
+        label = v if isinstance(v, str) else (v or {}).get("label") or str(c)
+        text = define(label)
+        if not text:
+            continue
+        if v is None or isinstance(v, str):
+            cfg[c] = st.column_config.Column(label, help=text)
+        elif not v.get("help"):
+            cfg[c] = {**v, "help": text}
+    st.dataframe(df, hide_index=True, column_config=cfg or None, **_stretch(st.dataframe), **kw)
 
 
 PANEL, SOFT = "#eaeaf2", "#9aa3b2"     # seaborn "darkgrid": gray-blue panel, white grid; SOFT = comparison bars
@@ -119,8 +255,10 @@ def show_chart(chart, title=None, subtitle=None, panel=True):
 
 
 def section(kicker, title, how):
-    st.markdown(f"<div class='kicker'>{kicker}</div>", unsafe_allow_html=True)
-    st.subheader(title)
+    """Chapter opener on the one-page scroll. The anchor comes from NAV, so the menu links land here."""
+    st.markdown(f"<div class='chapter'></div><div class='kicker'>{NAV_NUM[title]} · {kicker}</div>",
+                unsafe_allow_html=True)
+    st.subheader(title, anchor=NAV[title])
     st.markdown(how)
 
 
@@ -180,10 +318,12 @@ def load():
     if share is not None:
         share["Gross per film"] = share["Gross"] / share["Films"]
         share["Top film share"] = share["Top film gross"] / share["Gross"]
-    return films, models, share
+    pitch = json.loads((src / "pitch.json").read_text(encoding="utf-8"))
+    parents = pd.DataFrame(json.loads((src / "parents.json").read_text(encoding="utf-8")))
+    return films, models, share, pitch, parents
 
 
-FILMS, MODELS, SHARE = load()
+FILMS, MODELS, SHARE, PITCH, PARENTS = load()
 TITLE_BY_ID = dict(zip(FILMS["id"], FILMS["label"]))
 STUDIOS = [s for s in STUDIO_ORDER if s in set(FILMS["studio"])]
 GENRES = [g for g in GENRE_ORDER if g in set(FILMS["genre"])] + ["Other"]
@@ -193,7 +333,9 @@ GENRES = [g for g in GENRE_ORDER if g in set(FILMS["genre"])] + ["Other"]
 def money(v):
     if v is None or pd.isna(v):
         return "—"
-    return f"${v / 1e9:,.2f}B" if abs(v) >= 1e9 else f"${v / 1e6:,.1f}M"
+    sign = "−" if v < 0 else ""
+    v = abs(v)
+    return f"{sign}${v / 1e9:,.2f}B" if v >= 1e9 else f"{sign}${v / 1e6:,.1f}M"
 
 
 def fmt(v, spec="{:,.2f}", missing="—"):
@@ -237,6 +379,39 @@ def act_axis():
 
 def line_points(size=60):
     return alt.OverlayMarkDef(size=size, filled=True, stroke="white", strokeWidth=1.5)
+
+
+CSV_COLS = {"title": "Title", "year": "Year", "release": "Release date", "studio": "Studio", "distributor": "Distributor",
+            "genre": "Genre", "genres_all": "All genres", "mpaa": "Rating", "runtime": "Runtime (min)",
+            "kind": "Original / follow-up", "director": "Director", "cast": "Lead cast", "budget": "Budget ($)",
+            "opening": "Opening weekend US ($)", "domestic": "Domestic ($)", "international": "International ($)",
+            "worldwide": "Worldwide ($)", "multiple": "Return (x budget)", "theaters": "Opening theaters",
+            "drop2": "Week-2 drop (%)", "weeks": "Weeks in release", "imdb": "IMDb", "metascore": "Metascore",
+            "car5": "Parent 5-day stock reaction", "during_tone": "Parent call tone (release qtr)"}
+
+
+def csv_bytes(v):
+    return v[list(CSV_COLS)].rename(columns=CSV_COLS).to_csv(index=False).encode("utf-8")
+
+
+def comps(genre, budget, follow_up, year, exclude=None, k=6):
+    """Nearest films: same genre, then closest budget (log scale), same original/follow-up status and nearest year.
+    Distance = |log budget ratio| + 0.5 if the follow-up status differs + 1 per 20 years apart."""
+    pool = FILMS[(FILMS["genre"] == genre) & FILMS["budget"].notna() & FILMS["worldwide"].notna()]
+    if exclude is not None:
+        pool = pool[pool["id"] != exclude]
+    dist = (np.log(pool["budget"] / budget).abs() + 0.5 * (pool["follow_up"] != follow_up)
+            + (pool["year"] - year).abs() / 20)
+    return pool.loc[dist.nsmallest(k).index]
+
+
+def show_comps(c):
+    show_table(c[["title", "year", "studio", "kind", "budget_m", "worldwide_m", "multiple", "imdb"]], column_config={
+        "title": "Film", "year": st.column_config.NumberColumn("Year", format="%d"), "studio": "Studio",
+        "kind": "Original / follow-up", "budget_m": st.column_config.NumberColumn("Budget ($M)", format="%.0f"),
+        "worldwide_m": st.column_config.NumberColumn("Worldwide ($M)", format="%.0f"),
+        "multiple": st.column_config.NumberColumn("Return (×)", format="%.2f×"),
+        "imdb": st.column_config.NumberColumn("IMDb", format="%.1f")})
 
 
 # --- Header (always visible above the tabs) ---------------------------------------------------------------------
@@ -295,20 +470,10 @@ c2.markdown("**The Solution**  \n"
             "theatrical run), the **studio** (playbooks and market share), the **script** (the emotional arc of the "
             "dialogue, measured with NLP across five acts) and the **parent company** (how Wall Street and the "
             "quarter's financials responded). Use it to build the evidence behind your Bottom Line Up Front.")
-with st.expander("How to use this lab for your group's BLUF deck"):
-    st.markdown(
-        "1. **Start with a hunch from the case or yesterday's simulation** (e.g. *\"Universal should make more "
-        "original horror\"*).\n"
-        "2. **Find the pattern**: *Studio Playbooks* and *Trends & Franchise Fatigue* show what has paid off, and "
-        "for whom.\n"
-        "3. **Look inside the scripts**: *Script DNA* shows how the emotional arc of hits differs from misses.\n"
-        "4. **Check the money behind it**: *Wall Street Reaction* shows whether the parent company's stock noticed.\n"
-        "5. **Stress-test it**: *Predict the Box Office* shows how much of a film's success is predictable at all, "
-        "and which features still matter once the rest are held constant.\n"
-        "6. **Use real films as examples**: the *Movie Database* gives you comps for your slides.\n\n"
-        "Every chart's title states its takeaway for the current selection; paste it straight into a slide. Captions "
-        "say how to read the chart and what it can't tell you."
-    )
+st.markdown("<div class='navbar'>" + "".join(f"<a href='#{a}'><b>{NAV_NUM[t]}</b>{t}</a>" for t, a in NAV.items())
+            + "</div>", unsafe_allow_html=True)
+st.caption("Hover any number, column header or ⓘ for its definition. Section menu and full glossary: the › arrow at "
+           "the top left.")
 
 
 # --- 1. Movie Database --------------------------------------------------------------------------------------------
@@ -362,6 +527,8 @@ def database_section():
                f"rule of thumb is that a film needs roughly 2–3× to be profitable once marketing and the theaters' "
                f"share are paid. Week-2 drop = % of week-1 gross lost in week 2 (negative = it grew, usually a platform "
                f"release expanding). Dollars are nominal. Sources: The Numbers, Box Office Mojo, TMDB.*")
+    st.download_button(f"⬇ Download these {len(v):,} films (CSV)", csv_bytes(v), "box_office_lab_films.csv",
+                       "text/csv", on_click="ignore")
 
     exhibit("Film profile")
     if v.empty:
@@ -457,6 +624,11 @@ def render_profile(r):
             st.caption("*Solid = this film; dashed = the average film in its genre. Each point is the share of that act's "
                        "dialogue an NLP emotion model reads as that emotion. Acts follow the classic five-part "
                        "structure: exposition, rising action, climax, falling action, resolution.*")
+
+    if pd.notna(r["budget"]):
+        st.markdown(f"**Comparable films:** the {r['genre'].lower()} films closest to this one in budget, "
+                    f"original vs. follow-up and release year")
+        show_comps(comps(r["genre"], r["budget"], r["follow_up"], r["year"], exclude=r["id"]))
 
 
 # --- 2. Studio Playbooks --------------------------------------------------------------------------------------------
@@ -576,7 +748,8 @@ def studio_section():
         exhibit("Studio vs. studio, year by year (full slates, 1995–2023)")
         avail = [s for s in STUDIO_ORDER if s in set(SHARE["Studio"])]
         c1, c2, c3 = st.columns([2, 3, 1])
-        yname = c1.selectbox("Measure", list(YEARLY), key="yearly_metric")
+        yname = c1.selectbox("Measure", list(YEARLY), key="yearly_metric",
+                             help="  \n".join(f"**{k}**: {v}" for k, v in YEARLY_NOTES.items()))
         pick = c2.multiselect("Studios", avail, default=avail, key="yearly_studios")
         smooth = c3.toggle("3-year average", value=False, key="yearly_smooth",
                            help="Single years swing with one franchise release; smoothing shows the underlying trend.")
@@ -615,7 +788,7 @@ def studio_section():
 
     exhibit("Head-to-head: how have the studios' films changed?")
     c1, c2, c3 = st.columns([2, 3, 1])
-    hname = c1.selectbox("Measure", list(H2H), key="h2h_metric")
+    hname = c1.selectbox("Measure", list(H2H), key="h2h_metric", help=measure_help(H2H))
     pick = c2.multiselect("Studios (up to 4)", STUDIOS, default=["Universal", "Disney", "Warner Bros."],
                           max_selections=4, key="h2h_studios")
     per = c3.radio("Group years by", ["5 years", "Decade"], key="h2h_period")
@@ -647,7 +820,10 @@ def studio_section():
         for stu in pick:
             ds = FILMS[FILMS["studio"] == stu]
             table[stu] = [f"{len(ds)}"] + [fmt(h2h_value(ds, c, hw), "{:" + ff + "}") for c, hw, ff in H2H.values()]
-        show_table(pd.DataFrame(table))
+        table["What it means"] = [define(m) for m in table["Measure"]]
+        show_table(pd.DataFrame(table), column_config={
+            "What it means": st.column_config.TextColumn("What it means", width="large",
+                                                         help="Hover a cell to read the full definition.")})
         st.caption("*All years combined: the side-by-side for a slide. Who bets bigger, who leans on franchises, whose "
                    "films pay back.*")
 
@@ -658,7 +834,7 @@ def studio_section():
                 "of its returns (Village Roadshow with Warner, Dune with Fox). Which model has paid off?")
     members = company_members()
     c1, c2 = st.columns([2, 3])
-    cname = c1.selectbox("Measure", list(H2H), index=2, key="co_metric")
+    cname = c1.selectbox("Measure", list(H2H), index=2, key="co_metric", help=measure_help(H2H))
     picks = c2.multiselect("Companies (up to 12)", list(COMPANIES), max_selections=12, key="co_pick",
                            default=["Focus Features", "Working Title Films", "Amblin Entertainment", "Imagine Entertainment",
                                     "New Line Cinema", "Village Roadshow Pictures", "Legendary Pictures",
@@ -836,7 +1012,7 @@ def trends_section():
             "**How it works:** pick a measure and a way to slice the films. Medians are used instead of averages so a "
             "single billion-dollar outlier can't drag a whole group.")
     c1, c2, c3, c4 = st.columns(4)
-    mname = c1.selectbox("Measure", list(METRICS))
+    mname = c1.selectbox("Measure", list(METRICS), help=measure_help(METRICS))
     gname = c2.selectbox("Slice by", list(GROUPS))
     stu = c3.selectbox("Studio", ["All studios"] + STUDIOS, key="trend_studio")
     kind = c4.selectbox("Films", ["All films", "Originals only", "Follow-ups only"], key="trend_kind")
@@ -1097,9 +1273,17 @@ def ci_bars(d, order, colors, ytitle):
     return (bars + whisk + zero).properties(height=290)
 
 
+PARENT_METRICS = {  # label: (parents.json column, unit, how it's computed)
+    "Profit margin": ("Margin", "%", "net income ÷ revenue"),
+    "ROA": ("ROA", "% per quarter", "net income ÷ total assets"),
+    "Leverage": ("Leverage", "%", "debt ÷ total assets"),
+}
+PARENT_FILM_COL = {"Profit margin": "margin", "ROA": "roa", "Leverage": "leverage"}
+
+
 @st.fragment
 def wallstreet_section():
-    section("Parent companies", "Wall Street Reaction",
+    section("Parent companies", "Wall Street & Parent Companies",
             "**How it works:** a studio is a planet orbiting a much bigger parent (Universal belongs to Comcast). Here we "
             "ask whether investors noticed a film. The **stock reaction** is the parent's return beyond the overall "
             "market's from release day to five trading days later (a cumulative abnormal return). The **earnings-call "
@@ -1171,6 +1355,64 @@ def wallstreet_section():
                    f"not the levels.*")
     else:
         st.info("Too few films with earnings-call transcripts for this studio to compare hits and misses.")
+
+    exhibit("How healthy were the parent companies?")
+    metric = st.radio("Measure", list(PARENT_METRICS), horizontal=True, key="ws_metric")
+    col, unit, how = PARENT_METRICS[metric]
+    pa = PARENTS.groupby(["Studio", "Year"], as_index=False)[col].mean()
+    pa["Value"] = pa[col] * 100
+    pick = [x for x in STUDIOS if x in set(pa["Studio"])]
+    recent = pa[pa["Year"] >= pa["Year"].max() - 4].groupby("Studio")["Value"].mean()
+    lead = recent.idxmin() if metric == "Leverage" else recent.idxmax()
+    best = "lowest leverage" if metric == "Leverage" else f"highest {metric.lower() if metric != 'ROA' else 'ROA'}"
+    lo, hi = pa["Value"].quantile([0.04, 0.96])
+    pad = (hi - lo) * 0.15
+    show_chart(studio_lines(pa, alt.X("Year:Q", title=None, axis=alt.Axis(format="d")),
+                            alt.Y("Value:Q", title=f"{metric} ({unit})",
+                                  scale=alt.Scale(domain=[float(lo - pad), float(hi + pad)], clamp=True)), pick,
+                            ["Studio", "Year", alt.Tooltip("Value:Q", format=".2f", title=f"{metric} ({unit})")])
+               .properties(height=330),
+               f"Last five years: {lead}'s parent had the {best} ({recent[lead]:.1f}%)"
+               + ("" if lead == "Universal" else f"; Universal's {recent.get('Universal', np.nan):.1f}%"),
+               f"Parent company's {metric if metric == 'ROA' else metric.lower()} by year (average of its fiscal "
+               f"quarters): {how}")
+    st.caption("*Each line is the whole parent company (Comcast for Universal, Disney, Warner Bros. Discovery, Sony, "
+               "Paramount, Fox, Lionsgate), so film is one business among many: cable, parks, TV networks, streaming, "
+               "electronics. Years without a film in the data have no point. A few extreme years (2008 write-downs, Fox's "
+               "2019 gain from its sale to Disney) are pinned to the chart's edge so the other years stay readable; "
+               "hover for the true value. Dollar levels aren't shown because the "
+               "source file's revenue and income figures are on inconsistent scales; the ratios aren't affected. "
+               "Source: Compustat quarterly.*")
+
+    exhibit("Did the parent's results change after a hit?")
+    recs = []
+    for name, g in [("Hits (top 25% return)", hits), ("Misses (bottom 25% return)", misses)]:
+        for t, lab in [("prior", "Quarter before release"), ("during", "Release quarter"), ("post", "Quarter after")]:
+            v = g[f"{t}_{PARENT_FILM_COL[metric]}"].dropna() * 100
+            recs.append({"Group": name, "Quarter": lab, "Value": v.mean() if len(v) else np.nan, "Films": len(v)})
+    pq = pd.DataFrame(recs)
+    if pq["Films"].min() >= 10:
+        qorder = ["Quarter before release", "Release quarter", "Quarter after"]
+        groups = ["Hits (top 25% return)", "Misses (bottom 25% return)"]
+        tq = pq.set_index(["Group", "Quarter"])["Value"]
+        dh = tq[(groups[0], qorder[2])] - tq[(groups[0], qorder[0])]
+        dm = tq[(groups[1], qorder[2])] - tq[(groups[1], qorder[0])]
+        chart = alt.Chart(pq).mark_line(point=line_points(70), strokeWidth=2.25).encode(
+            x=alt.X("Quarter:N", sort=qorder, title=None, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("Value:Q", title=f"Average parent {metric if metric == 'ROA' else metric.lower()} ({unit})",
+                    scale=alt.Scale(zero=False)),
+            color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[BLUE, INK]),
+                            legend=alt.Legend(orient="top", title=None)),
+            tooltip=["Group", "Quarter", alt.Tooltip("Value:Q", format=".2f"), "Films"])
+        show_chart(chart.properties(height=290),
+                   f"From the quarter before to the quarter after, parent {metric if metric == 'ROA' else metric.lower()} "
+                   f"moved {dh:+.2f} pts around hits vs. {dm:+.2f} pts around misses",
+                   f"{stu}: parent's {metric if metric == 'ROA' else metric.lower()} in the quarters around each release")
+        st.caption("*Same hits and misses as above; switch the measure with the buttons above the previous chart. Compare "
+                   "the slopes, not the levels: hits and misses come from different parents and years. A flat line is "
+                   "the usual result, because one film rarely moves a conglomerate's quarter.*")
+    else:
+        st.info("Too few films with parent financials for this studio to compare hits and misses.")
 
     exhibit("Biggest stock reactions")
     cols = st.columns(2)
@@ -1480,18 +1722,352 @@ def render_recommendations(rows, heldout_ok, out_l):
                 unsafe_allow_html=True)
 
 
-# --- Page -----------------------------------------------------------------------------------------------------------
-tabs = st.tabs(["Movie Database", "Studio Playbooks", "Trends & Franchise Fatigue", "Script DNA",
-                "Wall Street Reaction", "Predict the Box Office"])
-with tabs[0]:
-    database_section()
-with tabs[1]:
-    studio_section()
-with tabs[2]:
-    trends_section()
-with tabs[3]:
-    script_section()
-with tabs[4]:
-    wallstreet_section()
-with tabs[5]:
-    predict_section()
+
+# --- 4-5. Film Economics and Pitch a Film ----------------------------------------------------------------------------
+# One fragment for both sections, so the deal assumptions set in Film Economics also price the pitch.
+ASSUME = {  # key: (label, min, max, default, step, help)
+    "dom": ("Studio's share of US ticket sales", 35, 65, 50, 1,
+            "Film rentals: the share of the domestic box office the theaters pass back to the distributor. Typically "
+            "45–55%, higher for blockbusters in their opening weeks."),
+    "intl": ("Studio's share of international tickets", 25, 55, 40, 1,
+             "Lower than at home because local distributors and taxes take a cut."),
+    "pa": ("Marketing (P&A) as % of production budget", 0, 120, 60, 5,
+           "Prints and advertising: the worldwide marketing spend. Wide releases often spend 50–100% of the production "
+           "budget. Not in the data, so you set it."),
+    "home": ("Home windows (PVOD, digital, disc) as % of US gross", 0, 50, 20, 5,
+             "Studio's net revenue from premium and regular video-on-demand, digital purchase and disc, as a share of "
+             "the domestic box office. Studios keep about 75% of a $20–30 PVOD rental."),
+    "stream": ("Streaming / pay-TV license as % of worldwide gross", 0, 40, 15, 5,
+               "What a streamer or pay-TV window (e.g. Peacock, a pay-1 deal) is worth, as a share of worldwide box "
+               "office. Rough by nature: set 0 to look at theaters alone."),
+}
+TIERS = [(0, 50e6, "Under $50M"), (50e6, 150e6, "$50–150M"), (150e6, np.inf, "$150M+")]
+
+
+def economics(d, a):
+    """Studio P&L per film under assumptions a (fractions). International falls back to worldwide − domestic."""
+    intl = d["international"].where(d["international"].notna(), d["worldwide"] - d["domestic"])
+    e = pd.DataFrame(index=d.index)
+    e["Rentals"] = d["domestic"] * a["dom"] + intl * a["intl"]
+    e["Budget"] = d["budget"]
+    e["P&A"] = d["budget"] * a["pa"]
+    e["Theatrical profit"] = e["Rentals"] - e["Budget"] - e["P&A"]
+    e["Home windows"] = d["domestic"] * a["home"]
+    e["Streaming"] = d["worldwide"] * a["stream"]
+    e["Full-cycle profit"] = e["Theatrical profit"] + e["Home windows"] + e["Streaming"]
+    return e
+
+
+def breakeven(a, dom_share):
+    """Worldwide gross ÷ budget a film needs to break even, theatrically and over the full cycle."""
+    k_theat = a["dom"] * dom_share + a["intl"] * (1 - dom_share)
+    k_full = k_theat + a["home"] * dom_share + a["stream"]
+    return (1 + a["pa"]) / k_theat, (1 + a["pa"]) / k_full
+
+
+def tier_of(b):
+    for lo, hi, name in TIERS:
+        if lo <= b < hi:
+            return name
+    return None
+
+
+def waterfall(rows):
+    """rows: [(label, amount, kind)], kind in start/up/down/total. Bars float from the running total."""
+    recs, run = [], 0.0
+    for label, v, kind in rows:
+        if kind in ("start", "total"):
+            lo, hi = 0.0, v
+            run = v
+        else:
+            lo, hi = run, run + v
+            run += v
+        recs.append({"Step": label, "Low": min(lo, hi), "High": max(lo, hi), "Amount": v,
+                     "Kind": kind if kind in ("start", "total") else ("up" if v >= 0 else "down")})
+    d = pd.DataFrame(recs)
+    order = list(d["Step"])
+    colors = {"start": SOFT, "up": BLUE, "down": INK, "total": CAT[2]}
+    base = alt.Chart(d).encode(x=alt.X("Step:N", sort=order, title=None, axis=alt.Axis(labelAngle=0, labelLimit=110)))
+    bars = base.mark_bar(size=44, cornerRadius=2).encode(
+        y=alt.Y("Low:Q", title="$M"), y2="High:Q",
+        color=alt.Color("Kind:N", scale=alt.Scale(domain=list(colors), range=list(colors.values())), legend=None),
+        tooltip=["Step", alt.Tooltip("Amount:Q", format="+,.1f", title="$M")])
+    text = base.mark_text(dy=-8, fontSize=11, color=INK).encode(
+        y="High:Q", text=alt.Text("Amount:Q", format=",.0f"))
+    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#6b7280").encode(y="y:Q")
+    return (bars + text + zero).properties(height=320)
+
+
+@st.fragment
+def economics_and_pitch():
+    section("Money", "Film Economics",
+            "**How it works:** a film's box office isn't the studio's revenue. Theaters keep roughly half of ticket "
+            "sales; the studio's share (*film rentals*) has to pay back the production budget **and** the marketing "
+            "(*prints and advertising*, P&A). Then come the later *windows*: premium video-on-demand (PVOD), digital and "
+            "disc, then streaming and pay TV. The data has budgets and grosses; you set the deal terms below, and every "
+            "number in this section and in *Pitch a Film* updates.")
+    with st.container(border=True):
+        st.markdown("**Your deal assumptions**")
+        cols = st.columns(5)
+        a = {}
+        for col, (k, (label, lo, hi, dflt, step, hlp)) in zip(cols, ASSUME.items()):
+            a[k] = col.slider(label, lo, hi, dflt, step, format="%d%%", help=hlp, key=f"eco_{k}") / 100
+
+    d = FILMS[FILMS["budget"].notna() & FILMS["worldwide"].notna() & FILMS["domestic"].notna()].copy()
+    e = economics(d, a)
+    d = d.join(e)
+    dom_share = float((d["domestic"] / d["worldwide"]).median())
+    be_t, be_f = breakeven(a, dom_share)
+    cols = st.columns(4)
+    cols[0].metric("Break-even, theaters only", f"{be_t:.1f}× budget",
+                   help=f"Worldwide gross ÷ budget needed to cover budget + P&A from film rentals, for a film earning "
+                        f"{dom_share * 100:.0f}% of its gross in the US (the median here).")
+    cols[1].metric("Break-even, full cycle", f"{be_f:.1f}× budget", help="Adding the home and streaming windows.")
+    cols[2].metric("Films profitable in theaters alone", f"{(d['Theatrical profit'] > 0).mean() * 100:.0f}%")
+    cols[3].metric("Films profitable over the full cycle", f"{(d['Full-cycle profit'] > 0).mean() * 100:.0f}%")
+    takeaway(f"Under these terms a film needs about <b>{be_t:.1f}× its budget</b> at the worldwide box office to break "
+             f"even in theaters, or <b>{be_f:.1f}×</b> counting the later windows. That's the case's "
+             f"\"two-to-three-times gross multiple\" made explicit.")
+
+    exhibit("From box office to profit: one film")
+    labels = list(d.sort_values("worldwide", ascending=False)["label"])
+    default = labels.index("Jurassic World (2015)") if "Jurassic World (2015)" in labels else 0
+    pick = st.selectbox("Film", labels, index=default, key="eco_film")
+    r = d[d["label"] == pick].iloc[0]
+    m = 1e6
+    rows = [("Worldwide gross", r["worldwide"] / m, "start"),
+            ("Theaters' share", -(r["worldwide"] - r["Rentals"]) / m, "down"),
+            ("Production budget", -r["Budget"] / m, "down"), ("Marketing (P&A)", -r["P&A"] / m, "down"),
+            ("Home windows", r["Home windows"] / m, "up"), ("Streaming / pay TV", r["Streaming"] / m, "up"),
+            ("Studio profit", r["Full-cycle profit"] / m, "total")]
+    verdict = "made" if r["Full-cycle profit"] >= 0 else "lost"
+    show_chart(waterfall(rows),
+               f"{r['title']} {verdict} an estimated {money(abs(r['Full-cycle profit']))} for the studio "
+               f"({money(r['Theatrical profit'])} from theaters alone)",
+               f"Estimated studio P&L, $M, under your assumptions ({r['multiple']:.2f}× budget at the box office)")
+    st.caption("*Gray = what the box office took in; black = what's paid out or kept by others; blue = later windows; "
+               "green = what's left for the studio. An estimate: real deals add distribution fees, talent "
+               "participations (gross points), co-financier shares and overhead, which all shrink the studio's share.*")
+
+    exhibit("Who makes money: theaters alone vs. the full cycle")
+    recs = []
+    for stu in STUDIOS:
+        g = d[d["studio"] == stu]
+        recs += [{"Studio": stu, "Window": "Theaters only", "Share": (g["Theatrical profit"] > 0).mean() * 100,
+                  "Films": len(g)},
+                 {"Studio": stu, "Window": "Full cycle", "Share": (g["Full-cycle profit"] > 0).mean() * 100,
+                  "Films": len(g)}]
+    w = pd.DataFrame(recs)
+    gain = w.pivot(index="Studio", columns="Window", values="Share")
+    gain = (gain["Full cycle"] - gain["Theaters only"]).sort_values(ascending=False)
+    wins = ["Theaters only", "Full cycle"]
+    bars = alt.Chart(w).mark_bar(cornerRadiusEnd=3, stroke="white", strokeWidth=0.8).encode(
+        x=alt.X("Studio:N", sort=STUDIOS, title=None, axis=alt.Axis(labelAngle=0, labelColor=studio_expr("value"),
+                                                                     labelFontWeight=600)),
+        xOffset=alt.XOffset("Window:N", sort=wins),
+        y=alt.Y("Share:Q", title="% of films profitable", scale=alt.Scale(domain=[0, 100])),
+        color=alt.Color("Window:N", sort=wins, scale=alt.Scale(domain=wins, range=[SOFT, BLUE]),
+                        legend=alt.Legend(orient="top", title=None)),
+        tooltip=["Studio", "Window", alt.Tooltip("Share:Q", format=".0f", title="% profitable"), "Films"])
+    show_chart(bars.properties(height=300),
+               f"The later windows rescue the most films at {gain.index[0]} (+{gain.iloc[0]:.0f} pts); "
+               f"Universal +{gain.get('Universal', np.nan):.0f} pts",
+               "Share of each studio's films with a positive estimated profit, under your assumptions")
+    st.caption("*Same assumptions for every studio, so differences come from what each studio made and how it "
+               "performed. In reality Disney and Universal own their streamers (Disney+, Peacock), which changes who "
+               "captures the streaming value.*")
+
+    exhibit("Big bets vs. many small bets")
+    d["Tier"] = d["budget"].map(tier_of)
+    tiers = [t[2] for t in TIERS]
+    recs = []
+    for t in tiers:
+        for kind in ["Original", "Follow-up"]:
+            g = d[(d["Tier"] == t) & (d["kind"] == kind)]["Full-cycle profit"] / 1e6
+            if len(g) >= 8:
+                recs.append({"Tier": t, "Kind": kind, "P10": g.quantile(0.1), "P50": g.median(),
+                             "P90": g.quantile(0.9), "Win": (g > 0).mean() * 100, "Films": len(g)})
+    rt = pd.DataFrame(recs)
+    kinds = ["Original", "Follow-up"]
+    base = alt.Chart(rt).encode(y=alt.Y("Tier:N", sort=tiers, title=None),
+                                yOffset=alt.YOffset("Kind:N", sort=kinds),
+                                color=alt.Color("Kind:N", sort=kinds, scale=alt.Scale(domain=kinds, range=[BLUE, CAT[1]]),
+                                                legend=alt.Legend(orient="top", title=None)))
+    tip = ["Tier", "Kind", alt.Tooltip("P10:Q", format=",.0f", title="Bad case (10th pct) $M"),
+           alt.Tooltip("P50:Q", format=",.0f", title="Typical (median) $M"),
+           alt.Tooltip("P90:Q", format=",.0f", title="Good case (90th pct) $M"),
+           alt.Tooltip("Win:Q", format=".0f", title="% profitable"), "Films"]
+    rng = base.mark_rule(strokeWidth=5, opacity=0.45).encode(x=alt.X("P10:Q", title="Estimated full-cycle profit ($M)"),
+                                                             x2="P90:Q", tooltip=tip)
+    mid = base.mark_point(filled=True, size=140, stroke="white", strokeWidth=1.5, opacity=1).encode(x="P50:Q", tooltip=tip)
+    zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#6b7280", strokeDash=[4, 3]).encode(x="x:Q")
+    if len(rt):
+        big = rt[rt["Tier"] == "$150M+"]
+        small = rt[rt["Tier"] == "Under $50M"]
+        tmed = d.groupby("Tier")["Full-cycle profit"].median()
+        title = (f"$150M+ films risk the most and earn the most: median {money(tmed['$150M+'])} vs. "
+                 f"{money(tmed['Under $50M'])} under $50M") if len(big) and len(small) else "Profit by budget tier"
+        show_chart((zero + rng + mid).properties(height=260), title,
+                   "Estimated full-cycle profit per film: dot = median, bar = 10th to 90th percentile")
+        show_table(rt.assign(Range=rt.apply(lambda x: f"{money(x['P10'] * 1e6)} to {money(x['P90'] * 1e6)}", axis=1))
+                   [["Tier", "Kind", "Films", "Win", "P50", "Range"]],
+                   column_config={"Win": st.column_config.NumberColumn("% profitable", format="%.0f%%"),
+                                  "P50": st.column_config.NumberColumn("Median profit ($M)", format="%.0f"),
+                                  "Range": "10th–90th percentile"})
+    st.caption("*Budget tiers in nominal dollars. Read the bars as risk: a long bar means outcomes swing widely, so a "
+               "slate needs several of these films for the averages to show up. Tiers with fewer than 8 films are "
+               "left out.*")
+
+    exhibit("When to release: the calendar")
+    cal = d[d["wide"] == 1].copy()
+    cal["Month"] = cal["month"].map(lambda x: MONTHS[int(x) - 1] if pd.notna(x) else None)
+    g = cal.groupby(["genre", "Month"])["multiple"].agg(["median", "size"]).reset_index()
+    g = g[g["size"] >= 4].rename(columns={"genre": "Genre", "median": "Value", "size": "n"})
+    rows_order = [x for x in GENRES if x in set(g["Genre"])]
+    if len(g):
+        top = g.loc[g[g["n"] >= 8]["Value"].idxmax()] if (g["n"] >= 8).any() else g.loc[g["Value"].idxmax()]
+        show_chart(heatmap(g, "Month", "Genre", MONTHS, rows_order, "Median return (×)", ".1f"),
+                   f"Best slot with 8+ films: {top['Genre'].lower()} in {top['Month']} "
+                   f"(median {top['Value']:.1f}× budget, {int(top['n'])} films)",
+                   "Median worldwide gross ÷ budget by genre and release month, wide releases", panel=False)
+    st.caption("*Blank cells have fewer than 4 films. Small cells are noisy: hover for the film count before you "
+               "build a release strategy on one square.*")
+
+    pitch_section(a)
+
+
+def pitch_predict(budget, genre, follow_up, rating, season, year):
+    """Median predicted worldwide gross from the Pitch model (log-linear), in dollars."""
+    pr = PITCH["params"]
+    z = pr["const"] + pr["Budget (log)"] * math.log(budget) + pr["Follow-up film"] * follow_up \
+        + pr["Release year"] * (year - 2015)
+    z += pr.get(f"Genre: {genre}", 0) + pr.get(f"Rated {rating}", 0) + pr.get(f"{season} release", 0)
+    return math.exp(z)
+
+
+def pitch_section(a):
+    section("Decide", "Pitch a Film",
+            "**How it works:** describe a film you'd greenlight. A regression fit on "
+            f"{PITCH['films']} wide releases since {PITCH['since']} predicts its worldwide gross from the choices a "
+            "studio makes before shooting (budget, genre, original or follow-up, rating, release season, year). Real "
+            "films missed that prediction by a known spread, so you get a **range**, not a point, and the deal terms "
+            "from *Film Economics* turn the range into a **chance of making money**.")
+    c1, c2, c3 = st.columns(3)
+    genre = c1.selectbox("Genre", [g for g in GENRES], index=GENRES.index("Horror") if "Horror" in GENRES else 0,
+                         key="pitch_genre")
+    budget = c2.select_slider("Production budget", options=[5, 10, 15, 20, 30, 40, 50, 60, 75, 90, 100, 125, 150, 175,
+                                                             200, 250, 300], value=30, format_func=lambda x: f"${x}M",
+                              key="pitch_budget") * 1e6
+    kind = c3.radio("Original or follow-up", ["Original", "Follow-up"], horizontal=True, key="pitch_kind")
+    c4, c5, c6 = st.columns(3)
+    rating = c4.selectbox("Rating", ["G", "PG", "PG-13", "R"], index=3, key="pitch_rating")
+    season = c5.selectbox("Release window", SEASON_ORDER, index=3, key="pitch_season",
+                          help="Winter = Jan–Feb, Spring = Mar–Apr, Summer = May–Aug, Fall = Sep–Oct, Holiday = Nov–Dec.")
+    year = c6.slider("Release year", 2000, 2027, 2026, key="pitch_year",
+                     help="The model has a gentle upward trend in nominal grosses; years after 2025 extend it.")
+    fu = 1 if kind == "Follow-up" else 0
+    mid = pitch_predict(budget, genre, fu, rating, season, year)
+    q = PITCH["resid_q"]
+    lo80, lo50, hi50, hi80 = (mid * math.exp(q[k]) for k in ("p10", "p25", "p75", "p90"))
+    peers = FILMS[(FILMS["genre"] == genre) & FILMS["domestic"].notna() & FILMS["worldwide"].notna()]
+    ds = float((peers["domestic"] / peers["worldwide"]).median()) if len(peers) else 0.5
+    be_t, be_f = breakeven(a, ds)
+    need = be_f * budget
+    resid = np.array(PITCH["resid"])
+    p_win = float((mid * np.exp(resid) >= need).mean() * 100)
+    k_full = (1 + a["pa"]) / be_f
+    profit = lambda gross: gross * k_full - budget * (1 + a["pa"])
+
+    cols = st.columns(4)
+    cols[0].metric("Predicted worldwide gross", money(mid), help="The model's median prediction.")
+    short = lambda v: f"${v / 1e9:.1f}B" if v >= 1e9 else f"${v / 1e6:.0f}M"
+    cols[1].metric("Likely range (middle 50%)", f"{short(lo50)}–{short(hi50)}",
+                   help=f"80% range: {money(lo80)} – {money(hi80)}.")
+    cols[2].metric("Needed to break even", money(need), help=f"{be_f:.1f}× budget over the full cycle "
+                                                              f"({ds * 100:.0f}% domestic, the {genre.lower()} median).")
+    cols[3].metric("Chance of a profit", f"{p_win:.0f}%",
+                   help="Share of the model's past misses that would still leave this film above break-even.")
+    takeaway(f"A {money(budget)} {kind.lower()} {genre.lower()} film rated {rating}, released in {season.lower()} "
+             f"{year}: typical outcome <b>{money(mid)}</b> worldwide and an estimated studio profit of "
+             f"<b>{money(profit(mid))}</b>, with a <b>{p_win:.0f}% chance</b> of making money under your deal terms.")
+
+    sc = pd.DataFrame([{"Case": "Bad case (1 in 10 do worse)", "Gross": lo80}, {"Case": "Weak (1 in 4)", "Gross": lo50},
+                       {"Case": "Typical", "Gross": mid}, {"Case": "Strong (1 in 4)", "Gross": hi50},
+                       {"Case": "Great case (1 in 10 do better)", "Gross": hi80}])
+    sc["Profit"] = sc["Gross"].map(profit) / 1e6
+    order = list(sc["Case"])
+    base = alt.Chart(sc).encode(x=alt.X("Case:N", sort=order, title=None, axis=alt.Axis(labelAngle=0, labelLimit=150)))
+    bars = base.mark_bar(size=50, cornerRadiusEnd=3).encode(
+        y=alt.Y("Profit:Q", title="Estimated studio profit ($M)"),
+        color=alt.condition("datum.Profit >= 0", alt.value(BLUE), alt.value(INK)),
+        tooltip=["Case", alt.Tooltip("Gross:Q", format="$,.0f", title="Worldwide gross"),
+                 alt.Tooltip("Profit:Q", format="+,.0f", title="Profit ($M)")])
+    lab = base.mark_text(fontSize=11, color=INK, dy=-8).encode(y=alt.Y("Profit:Q"),
+                                                               text=alt.Text("Profit:Q", format="+,.0f"))
+    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#6b7280").encode(y="y:Q")
+    show_chart((bars + lab + zero).properties(height=300),
+               f"{p_win:.0f}% chance of profit: loses money in the weak case" if profit(lo50) < 0
+               else f"{p_win:.0f}% chance of profit: still profitable in the weak case",
+               "Estimated full-cycle studio profit across the range of outcomes, $M")
+    st.caption(f"*Ranges come from how far real films landed from this model's predictions on films it didn't see "
+               f"(cross-validated R² {PITCH['r2_cv']:.2f}: the model explains about {PITCH['r2_cv'] * 100:.0f}% of the "
+               f"variation; the rest is execution, marketing, competition and luck). Nominal dollars. An association "
+               f"model, not a causal one: summer slots and sequels go to films studios already believe in. And the films "
+               f"in this dataset are ones whose scripts were available, which tilts toward well-known films, so "
+               f"read the chances as optimistic.*")
+
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown("**Comparable films** (same genre, closest budget, status and year)")
+        show_comps(comps(genre, budget, fu, year))
+    with right:
+        st.markdown("**What moves the forecast**")
+        pr = PITCH["params"]
+        lines = [("Doubling the budget", (2 ** pr["Budget (log)"] - 1) * 100),
+                 ("Follow-up instead of original", (math.exp(pr["Follow-up film"]) - 1) * 100),
+                 ("Summer instead of winter", (math.exp(pr["Summer release"]) - 1) * 100),
+                 ("PG-13 instead of R", (math.exp(pr["Rated PG-13"]) - 1) * 100),
+                 (f"{genre} instead of drama", (math.exp(pr.get(f"Genre: {genre}", 0)) - 1) * 100)]
+        show_table(pd.DataFrame(lines, columns=["Change", "Effect on predicted gross"]), column_config={
+            "Effect on predicted gross": st.column_config.NumberColumn(
+                format="%+.0f%%", help="% change in the predicted worldwide gross from this one change, all else equal.")})
+        st.caption("*Holding the other choices fixed. Doubling the budget raises the predicted gross by less than "
+                   "double, which is why bigger budgets need a bigger hit to pay back.*")
+
+
+# --- Sidebar: menu + glossary ---------------------------------------------------------------------------------------
+GLOSSARY = {
+    "Return (× budget)": "Worldwide box office ÷ production budget. Also called the gross multiple.",
+    "Film rentals": "The studio's share of ticket sales after theaters take theirs: about half in the US, less abroad.",
+    "P&A": "Prints and advertising: the marketing spend to launch a film, on top of the production budget.",
+    "Break-even multiple": "The return (× budget) a film needs before rentals cover budget plus marketing.",
+    "Windows": "The release sequence after theaters: PVOD, digital and disc, then pay TV and streaming, then free TV.",
+    "PVOD": "Premium video-on-demand: renting a new film at home for $20–30, weeks after it opens.",
+    "Follow-up": "A sequel, prequel, reboot, remake or spin-off of an earlier film. Adaptations count as originals.",
+    "Week-2 drop": "% of the first week's gross lost in the second week. Higher = more front-loaded.",
+    "Abnormal return": "A stock's return minus the overall market's, so market-wide moves don't count.",
+    "Earnings-call tone": "How upbeat executives sounded on the quarterly call, scored by FinBERT (−1 to +1).",
+    "ROA": "Return on assets: net income ÷ total assets.",
+    "Profit margin": "Net income ÷ revenue.",
+    "Leverage": "Debt ÷ total assets.",
+    "R²": "Share of the variation a model explains: 1 = perfect, 0 = no better than guessing the average.",
+    "Cross-validation": "Scoring a model on films it didn't learn from, several times over, for an honest grade.",
+    "p-value": "How surprising a result would be if there were no real relationship. Below 0.10 = flagged here.",
+    "95% interval": "The range that would contain the true average 95% of the time. Crossing zero = can't rule out none.",
+}
+with st.sidebar:
+    st.markdown("### Sections")
+    st.markdown("\n".join(f"{NAV_NUM[t]}. [{t}](#{a})" for t, a in NAV.items()))
+    st.markdown("### Glossary")
+    for term, text in GLOSSARY.items():
+        st.markdown(f"**{term}**  \n<span style='color:{MUTED};font-size:.85rem'>{text}</span>",
+                    unsafe_allow_html=True)
+
+# --- Page: one long scroll, in NAV order -----------------------------------------------------------------------------
+studio_section()
+trends_section()
+script_section()
+economics_and_pitch()
+wallstreet_section()
+predict_section()
+database_section()
