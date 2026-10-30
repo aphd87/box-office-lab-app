@@ -191,7 +191,12 @@ h2, h3, h4 {{ font-weight: 650 !important; letter-spacing: -0.015em; color: {INK
 .stTabs [data-baseweb="tab-list"] {{ gap: 1.4rem; border-bottom: 1px solid #e5e7eb; }}
 .stTabs [data-baseweb="tab"] p {{ font-weight: 600; font-size: .95rem; }}
 .chapter {{ border-top: 2px solid {INK}; margin: 3.2rem 0 1.1rem; }}
-.navbar {{ display: flex; flex-wrap: wrap; gap: .45rem; margin: .6rem 0 1.4rem; }}
+.navbar {{ display: flex; flex-wrap: wrap; gap: .45rem; margin: .6rem 0 1.4rem; padding: .5rem 0;
+           background: #fff; border-bottom: 1px solid #e5e7eb; }}
+/* Section pills stay pinned under Streamlit's header while scrolling; headings land below the bar when clicked */
+div[data-testid="stElementContainer"]:has(.navbar), div.element-container:has(.navbar) {{
+    position: sticky; top: 3.75rem; z-index: 990; }}
+.jump {{ position: relative; }} .jump span {{ position: absolute; top: -11rem; }}
 .navbar a {{ text-decoration: none; font-size: .82rem; font-weight: 600; color: {INK}; border: 1px solid #e5e7eb;
              border-radius: 999px; padding: .28rem .8rem; background: #fff; }}
 .navbar a:hover {{ border-color: {BLUE}; color: {BLUE}; }}
@@ -259,9 +264,10 @@ def show_chart(chart, title=None, subtitle=None, panel=True):
 
 def section(kicker, title, how):
     """Chapter opener on the one-page scroll. The anchor comes from NAV, so the menu links land here."""
-    st.markdown(f"<div class='chapter'></div><div class='kicker'>{NAV_NUM[title]} · {kicker}</div>",
-                unsafe_allow_html=True)
-    st.subheader(title, anchor=NAV[title])
+    # The jump target sits above the heading so the pinned section bar doesn't cover it
+    st.markdown(f"<div class='chapter'></div><div class='jump'><span id='{NAV[title]}'></span></div>"
+                f"<div class='kicker'>{NAV_NUM[title]} · {kicker}</div>", unsafe_allow_html=True)
+    st.subheader(title, anchor=False)
     st.markdown(how)
 
 
