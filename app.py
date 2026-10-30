@@ -236,10 +236,10 @@ PANEL, SOFT = "#eaeaf2", "#9aa3b2"     # seaborn "darkgrid": gray-blue panel, wh
 
 def show_chart(chart, title=None, subtitle=None, panel=True):
     """House style for every chart, after seaborn's darkgrid: a soft gray-blue panel with white gridlines, no axis
-    lines or ticks, an action title that states the takeaway and a subtitle naming the measure. Heatmaps pass
-    panel=False (white background, as in seaborn)."""
-    if title:
-        chart = chart.properties(title=alt.TitleParams(text=title, subtitle=subtitle or "", anchor="start"))
+    lines or ticks. The heading names the measure (subtitle); the insight (title) goes in a takeaway box under the
+    chart, so every chart ends with its answer. Heatmaps pass panel=False (white background, as in seaborn)."""
+    if subtitle or title:
+        chart = chart.properties(title=alt.TitleParams(text=subtitle or title, anchor="start"))
     grid = dict(grid=True, gridColor="white", gridWidth=1.2, domain=False, ticks=False)
     chart = (chart.configure(font=FONT, background="white", padding={"left": 4, "right": 18, "top": 6, "bottom": 4})
              .configure_view(stroke=None, fill=PANEL if panel else "white")
@@ -253,6 +253,8 @@ def show_chart(chart, title=None, subtitle=None, panel=True):
              .configure_legend(labelFontSize=11, labelColor="#374151", symbolType="circle", symbolSize=80,
                                titleFontSize=11, titleColor=MUTED, columnPadding=14))
     st.altair_chart(chart, theme=None, **_stretch(st.altair_chart))
+    if title and subtitle:
+        takeaway(f"<b>Answer:</b> {title}")
 
 
 def section(kicker, title, how):
@@ -524,10 +526,8 @@ def database_section():
         "imdb": st.column_config.NumberColumn("IMDb", format="%.1f"),
         "metascore": st.column_config.NumberColumn("Metascore", format="%d"),
     })
-    st.caption(f"*{len(v):,} of {len(FILMS):,} films match. Return = worldwide box office ÷ production budget; the case's "
-               f"rule of thumb is that a film needs roughly 2–3× to be profitable once marketing and the theaters' "
-               f"share are paid. Week-2 drop = % of week-1 gross lost in week 2 (negative = it grew, usually a platform "
-               f"release expanding). Dollars are nominal. Sources: The Numbers, Box Office Mojo, TMDB.*")
+    st.caption(f"*{len(v):,} of {len(FILMS):,} films match. A negative week-2 drop means the gross grew (usually a "
+               f"platform release expanding). Sources: The Numbers, Box Office Mojo, TMDB.*")
     st.download_button(f"⬇ Download these {len(v):,} films (CSV)", csv_bytes(v), "box_office_lab_films.csv",
                        "text/csv", on_click="ignore")
 
@@ -587,14 +587,9 @@ def render_profile(r):
         st.markdown("**The parent company around the release**")
         cols = st.columns(3)
         na = "N/A" if isinstance(r.get("wrong_parent_note"), str) else "—"
-        cols[0].metric("Stock reaction, 5 days", fmt(r["car5"] * 100 if pd.notna(r["car5"]) else np.nan, "{:+.1f}%", na),
-                       help="Parent company's stock return beyond the market's, from release day to 5 trading days "
-                            "later (cumulative abnormal return).")
-        cols[1].metric("Earnings-call tone", fmt(r["during_tone"], "{:+.2f}", na),
-                       help="Tone of the parent's earnings call in the release quarter, scored by FinBERT: share of "
-                            "positive minus negative sentences (−1 to +1).")
-        cols[2].metric("Parent ROA (quarter)", fmt(r["during_roa"] * 100 if pd.notna(r["during_roa"]) else np.nan, "{:.2f}%"),
-                       help="Net income ÷ total assets in the release quarter.")
+        cols[0].metric("Stock reaction, 5 days", fmt(r["car5"] * 100 if pd.notna(r["car5"]) else np.nan, "{:+.1f}%", na))
+        cols[1].metric("Earnings-call tone", fmt(r["during_tone"], "{:+.2f}", na))
+        cols[2].metric("Parent ROA (quarter)", fmt(r["during_roa"] * 100 if pd.notna(r["during_roa"]) else np.nan, "{:.2f}%"))
         if isinstance(r.get("parent"), str):
             share = r.get("film_share_parent")
             st.caption(f"Parent at release: **{r['parent']}**"
@@ -825,16 +820,6 @@ def studio_section():
                    "films are hidden (hover for counts). There are a few films per studio per year, so compare broad "
                    "directions, not small gaps.*")
 
-        table = {"Measure": ["Films in this dataset"] + list(H2H)}
-        for stu in pick:
-            ds = FILMS[FILMS["studio"] == stu]
-            table[stu] = [f"{len(ds)}"] + [fmt(h2h_value(ds, c, hw), "{:" + ff + "}") for c, hw, ff in H2H.values()]
-        table["What it means"] = [define(m) for m in table["Measure"]]
-        show_table(pd.DataFrame(table), column_config={
-            "What it means": st.column_config.TextColumn("What it means", width="large",
-                                                         help="Hover a cell to read the full definition.")})
-        st.caption("*All years combined: the side-by-side for a slide. Who bets bigger, who leans on franchises, whose "
-                   "films pay back.*")
 
     exhibit("Beyond the majors: labels, producers and co-financiers")
     st.markdown("Majors rarely work alone. **Labels** are brands inside a major aimed at a different audience (Focus "
@@ -951,9 +936,8 @@ def studio_section():
         f"Hit rate (≥{HIT_MULTIPLE}×)": "{:.0f}%", "Follow-ups (%)": "{:.0f}%", "Median week-2 drop (%)": "{:.0f}%",
         "Median IMDb": "{:.1f}"}).map(lambda v: f"color: {studio_text(v)}; font-weight: 600", subset=["Studio"])
     show_table(card)
-    st.caption(f"*Hit rate = share of the studio's films grossing at least {HIT_MULTIPLE}× their production budget "
-               f"worldwide. These are the studio's films **in this dataset** (films whose scripts were available), not "
-               f"its full slate, so read them as a sample.*")
+    st.caption("*These are the studio's films **in this dataset** (films whose scripts were available), not its full "
+               "slate, so read them as a sample.*")
 
     exhibit("What each studio makes")
     metric = st.radio("Color the grid by", ["Share of the studio's films", "Median return on budget"], horizontal=True,
@@ -1088,9 +1072,8 @@ def trends_section():
     labels = bars.mark_text(dy=-7, fontSize=11, color=INK).encode(text=alt.Text("median:Q", format=".0f"))
     show_chart((bars + labels).properties(height=310), title, "Median week-1 to week-2 drop, wide releases, by decade")
     st.caption("*Wide releases only (600+ opening theaters), decades with at least 5 films per group. The drop is week 1 "
-               "to week 2 (7-day grosses), a little gentler than the case's weekend-to-weekend figures but the same "
-               "pattern: runs have become far more front-loaded, and follow-ups drop harder than originals in every "
-               "decade. Fans who waited for the sequel show up opening weekend, leaving fewer new viewers for week two.*")
+               "to week 2 (7-day grosses), a little gentler than the case's weekend-to-weekend figures. Fans who waited "
+               "for the sequel show up opening weekend, leaving fewer new viewers for week two.*")
 
     o, fu = FILMS[FILMS["follow_up"] == 0], FILMS[FILMS["follow_up"] == 1]
     cols = st.columns(4)
@@ -1101,10 +1084,9 @@ def trends_section():
     cols[2].metric(f"Hit rate (≥{HIT_MULTIPLE}×) · follow-up vs. original",
                    f"{fu['hit'].mean() * 100:.0f}% vs. {o['hit'].mean() * 100:.0f}%")
     cols[3].metric("Median IMDb · follow-up vs. original", f"{median(fu['imdb']):.1f} vs. {median(o['imdb']):.1f}")
-    takeaway(f"<b>So what:</b> follow-ups gross more (median {money(median(fu['worldwide']))} vs. "
-             f"{money(median(o['worldwide']))}) but burn out faster. A franchise buys a big, safer opening and a short "
-             f"run. Descriptive only: studios greenlight sequels to their biggest hits, so follow-ups start from proven "
-             f"demand ({len(fu)} follow-ups vs. {len(o)} originals).")
+    takeaway(f"<b>So what:</b> a franchise buys a bigger, safer opening and a shorter run. Descriptive only: studios "
+             f"greenlight sequels to their biggest hits, so follow-ups start from proven demand ({len(fu)} follow-ups "
+             f"vs. {len(o)} originals).")
 
     st.markdown("**The steepest week-2 drops among follow-ups since 2000**")
     t = fu[(fu["wide"] == 1) & (fu["year"] >= 2000)].nlargest(12, "drop2")
@@ -2107,6 +2089,10 @@ GLOSSARY = {
     "p-value": "How surprising a result would be if there were no real relationship. Below 0.10 = flagged here.",
     "95% interval": "The range that would contain the true average 95% of the time. Crossing zero = can't rule out none.",
 }
+for term, key in [("Return (× budget)", "return"), ("Follow-up", "follow-up"), ("Week-2 drop", "week-2 drop"),
+                  ("Earnings-call tone", "tone"), ("ROA", "roa"), ("Profit margin", "margin"),
+                  ("Leverage", "leverage"), ("R²", "r²"), ("p-value", "p-value")]:
+    GLOSSARY[term] = define(key)
 with st.sidebar:
     st.markdown("### Sections")
     st.markdown("\n".join(f"{NAV_NUM[t]}. [{t}](#{a})" for t, a in NAV.items()))
