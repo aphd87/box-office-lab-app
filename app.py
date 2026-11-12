@@ -254,6 +254,14 @@ section[data-testid="stSidebar"] a {{ text-decoration: none; color: {INK}; }}
 [data-testid="stIconMaterial"], .material-symbols-rounded, [class*="material-symbols"] {{
     font-family: 'Material Symbols Rounded' !important; }}
 [data-testid="stCaptionContainer"] p, .stCaption p {{ color: {MUTED}; }}
+.skey {{ display: flex; flex-wrap: wrap; gap: .6rem; margin: .4rem 0 .2rem; }}
+.skey-card {{ flex: 1 1 96px; max-width: 150px; text-align: center; padding: .5rem .4rem .45rem;
+              border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; }}
+.skey-logo {{ height: 40px; display: flex; align-items: center; justify-content: center; }}
+.skey-logo img {{ max-height: 40px; max-width: 100%; object-fit: contain; }}
+.skey-swatch {{ height: 5px; border-radius: 3px; margin: .45rem .3rem .3rem; }}
+.skey-name {{ font-size: .8rem; font-weight: 650; }}
+.skey-note {{ font-size: .72rem; color: {MUTED}; margin-bottom: .6rem; }}
 .takeaway {{ border-left: 3px solid {BLUE}; background: #f5f9ff; padding: .75rem 1rem; margin: .4rem 0 1rem;
              color: {INK}; border-radius: 0 4px 4px 0; }}
 .takeaway b {{ color: {BLUE}; }}
@@ -470,6 +478,29 @@ FILMS, MODELS, SHARE, PITCH, PARENTS = load()
 TITLE_BY_ID = dict(zip(FILMS["id"], FILMS["label"]))
 STUDIOS = [s for s in STUDIO_ORDER if s in set(FILMS["studio"])]
 GENRES = [g for g in GENRE_ORDER if g in set(FILMS["genre"])] + ["Other"]
+
+
+@st.cache_resource(show_spinner=False)
+def studio_key_html():
+    """One row of studio logos, each over its chart color, so students can tell the studios apart. Logos come from
+    data/logos.json (tools/fetch_logos.py: Wikimedia Commons files marked public domain, still trademarks); without
+    the file the key just shows the colored names. Built once per server and shared by every session."""
+    path = data_dir() / "logos.json"
+    logos = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    cards = []
+    for stu in STUDIOS:
+        img = (f"<img src='{logos[stu]['src']}' alt='{stu} logo'>" if stu in logos else "")
+        swatch = f"background:{STUDIO_COLOR[stu]};" + (f"box-shadow: inset 0 0 0 1px {KEYLINE};" if stu == "Paramount" else "")
+        cards.append(f"<div class='skey-card'><div class='skey-logo'>{img}</div>"
+                     f"<div class='skey-swatch' style='{swatch}'></div>"
+                     f"<div class='skey-name' style='color:{studio_text(stu)}'>{stu}</div></div>")
+    note = ("Logos identify the studios only. They are trademarks of their owners; files from Wikimedia Commons."
+            if logos else "")
+    return f"<div class='skey'>{''.join(cards)}</div><div class='skey-note'>{note}</div>"
+
+
+def studio_key():
+    st.markdown(studio_key_html(), unsafe_allow_html=True)
 
 
 # --- Small helpers ---------------------------------------------------------------------------------------------
@@ -1001,6 +1032,7 @@ def studio_section():
             "changed, what each one makes, when it releases, and how it pays off. (Full-slate market share year by "
             "year is in [*Who's Winning*](#winning).) Each studio keeps its own color throughout, with Universal in "
             "NBCU purple.")
+    studio_key()
 
     exhibit("Head-to-head: how have the studios' films changed?")
     c1, c2, c3 = st.columns([2, 3, 1])
@@ -2171,6 +2203,7 @@ def money_sections():
             "**How it works:** three views of who is winning and where Universal should put capital: full-slate market "
             "share year by year, which studios' films pay back under your deal terms, and how risk grows with budget. "
             "The deal sliders are at the top of [*Film Economics*](#economics); move them and the last two charts update.")
+    studio_key()
     studio_share_chart()
 
     exhibit("Who makes money: theaters alone vs. the full cycle")
