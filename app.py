@@ -11,6 +11,7 @@ in DATA_REPO using the HF_TOKEN secret, and APP_PASSWORD (also a secret) gates t
 and there is no password unless APP_PASSWORD is set.
 """
 import hashlib
+import html
 import hmac
 import inspect
 import json
@@ -716,15 +717,28 @@ def database_section():
     render_profile(v[v["label"] == pick].iloc[0])
 
 
+TMDB_IMG = "https://image.tmdb.org/t/p/w342"   # the student's browser loads posters from TMDB; nothing is stored here
+
+
 def render_profile(r):
-    st.markdown(f"### {r['title']} ({r['year']})")
-    bits = [r["studio"], r["genre"], f"Rated {r['mpaa']}" if r["mpaa"] != "Unrated/unknown" else "Unrated/unknown",
-            f"{int(r['runtime'])} min" if pd.notna(r["runtime"]) else None, r["kind"],
-            pd.to_datetime(r["release"]).strftime("released %b %d, %Y") if r["release"] else None]
-    st.caption(" · ".join(b for b in bits if b))
-    if isinstance(r["logline"], str):
-        st.markdown(f"*{r['logline']}*")
-    st.markdown(f"**Director:** {r['director'] or '—'}  \n**Cast:** {r['cast'] or '—'}")
+    poster = r.get("poster")
+    head = st.columns([1, 5]) if isinstance(poster, str) else [None, st.container()]
+    if head[0] is not None:
+        with head[0]:
+            st.markdown(f"<img src='{TMDB_IMG}{poster}' alt='Poster for {html.escape(r['title'], quote=True)}' "
+                        f"style='width:100%;max-width:200px;border-radius:6px;border:1px solid #e5e7eb'>",
+                        unsafe_allow_html=True)
+            st.caption("Poster: [TMDB](https://www.themoviedb.org). This product uses the TMDB API but is not "
+                       "endorsed or certified by TMDB.")
+    with head[1]:
+        st.markdown(f"### {r['title']} ({r['year']})")
+        bits = [r["studio"], r["genre"], f"Rated {r['mpaa']}" if r["mpaa"] != "Unrated/unknown" else "Unrated/unknown",
+                f"{int(r['runtime'])} min" if pd.notna(r["runtime"]) else None, r["kind"],
+                pd.to_datetime(r["release"]).strftime("released %b %d, %Y") if r["release"] else None]
+        st.caption(" · ".join(b for b in bits if b))
+        if isinstance(r["logline"], str):
+            st.markdown(f"*{r['logline']}*")
+        st.markdown(f"**Director:** {r['director'] or '—'}  \n**Cast:** {r['cast'] or '—'}")
 
     peers = FILMS[FILMS["genre"] == r["genre"]]
     cols = st.columns(6)
