@@ -50,20 +50,39 @@ st.set_page_config(page_title="Behind the Box Office Lab", page_icon="🎬", lay
                    initial_sidebar_state="collapsed")
 
 # --- Design system ---------------------------------------------------------------------------------------------
+# Every chart color comes from one of these roles, and each role means one thing everywhere on the page:
+#   Studio identity  STUDIO_COLOR       only when a chart is split by studio
+#   Genre            GENRE_COLOR (CAT)  only for genres
+#   Emotion          EMOTION_COLOR      only for script emotions; a deeper family than the genre colors so the two
+#                                       never look alike (checked: every emotion >= 14.7 OKLab dE from every genre)
+#   Focus vs. comparison  FOCUS / COMPARE   neutral two-group splits: follow-up vs. original, full cycle vs.
+#                                           theaters only, one company vs. all films (focus is always the first)
+#   Good vs. bad     GOOD / BAD         outcomes with a sign: hits vs. misses, profit vs. loss, +/- effects
+#   Magnitude        light blue -> BLUE heatmaps and ordered steps
+#   Neutrals         INK text, MUTED secondary text, RULE zero/reference lines, KEYLINE outlines
 BLUE, INK, GRAY, MUTED = "#3582F0", "#111827", "#9ca3af", "#6b7280"
-# Categorical slots in fixed order (brand blue first; checked for color-vision-deficiency separation)
+PANEL, SOFT = "#eaeaf2", "#9aa3b2"     # seaborn "darkgrid": gray-blue panel, white grid; SOFT = comparison marks
+FOCUS, COMPARE = BLUE, SOFT
+GOOD, BAD = BLUE, INK
+RULE = MUTED
+KEYLINE = "#374151"
+RAMP3 = ["#b9d3f8", "#76a9f4", BLUE]  # three ordered steps, light to dark (e.g. simpler -> more flexible models)
+# Genre slots in fixed order (checked for color-vision-deficiency separation)
 CAT = ["#3582F0", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 FONT = "Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif"
 GENRE_ORDER = ["Action", "Comedy", "Drama", "Adventure", "Crime", "Biography", "Animation", "Horror"]
 GENRE_COLOR = dict(zip(GENRE_ORDER, CAT)) | {"Other": GRAY}     # color follows the entity, never its rank
 EMOTIONS = ["Joy", "Surprise", "Fear", "Sadness", "Anger", "Disgust", "Neutral"]
-EMOTION_COLOR = dict(zip(EMOTIONS, CAT))
+# Validated all-pairs on the chart panel (normal vision dE >= 15, protan/deutan dE >= 8); Neutral is a plain gray on
+# purpose. Deliberately darker than the genre colors, which is what keeps the two families apart.
+EMOTION_COLOR = {"Joy": "#937104", "Surprise": "#bb51c1", "Fear": "#690d95", "Sadness": "#006482",
+                 "Anger": "#a60455", "Disgust": "#315418", "Neutral": "#8b9099"}
 STUDIO_ORDER = ["Universal", "Disney", "Warner Bros.", "Sony", "Paramount", "Fox", "Lionsgate"]
-# Each studio keeps one brand-inspired color in every chart (checked for color-vision-deficiency separation on the
-# chart panel). Paramount is white, so its marks get a charcoal keyline and its text is charcoal.
-STUDIO_COLOR = {"Universal": "#8e3aa8", "Disney": "#1d4ed8", "Warner Bros.": "#7a5216", "Sony": "#7d8899",
-                "Paramount": "#ffffff", "Fox": "#c2185b", "Lionsgate": "#e8a200"}
-KEYLINE = "#374151"
+# Each studio keeps one color in every chart (validated all-pairs on the chart panel for color-vision deficiency).
+# Universal is NBCU purple. Disney is orange, not blue, so it never reads as the page's focus blue. Paramount is
+# white, so its marks get a charcoal keyline and its text is charcoal.
+STUDIO_COLOR = {"Universal": "#8e3aa8", "Disney": "#e5631f", "Warner Bros.": "#7a5216", "Sony": "#7d8899",
+                "Paramount": "#ffffff", "Fox": "#c2185b", "Lionsgate": "#d9a900"}
 
 
 def studio_text(stu):
@@ -267,7 +286,6 @@ def show_table(df, column_config=None, **kw):
     st.dataframe(df, hide_index=True, column_config=cfg or None, **_stretch(st.dataframe), **kw)
 
 
-PANEL, SOFT = "#eaeaf2", "#9aa3b2"     # seaborn "darkgrid": gray-blue panel, white grid; SOFT = comparison bars
 
 
 # --- Shared chart cache -------------------------------------------------------------------------------------------
@@ -368,12 +386,12 @@ def _house_style(chart, title, subtitle, panel):
              .configure_view(stroke=None, fill=PANEL if panel else "white")
              .configure_title(fontSize=15, fontWeight=600, color=INK, subtitleColor=MUTED, subtitleFontSize=12,
                               subtitleFontWeight="normal", anchor="start", offset=14, subtitlePadding=5)
-             .configure_axis(labelColor="#374151", titleColor=MUTED, labelFontSize=11, titleFontSize=11,
+             .configure_axis(labelColor=KEYLINE, titleColor=MUTED, labelFontSize=11, titleFontSize=11,
                              titleFontWeight="normal", labelPadding=6, domain=False, ticks=False)
              .configure_axisQuantitative(**grid)
              .configure_axisTemporal(**grid)
              .configure_axisDiscrete(grid=False)
-             .configure_legend(labelFontSize=11, labelColor="#374151", symbolType="circle", symbolSize=80,
+             .configure_legend(labelFontSize=11, labelColor=KEYLINE, symbolType="circle", symbolSize=80,
                                titleFontSize=11, titleColor=MUTED, columnPadding=14))
     return chart
 
@@ -826,7 +844,6 @@ COMPANIES = {  # name: (search pattern in the credits, business model, home stud
     "Summit Entertainment": ("summit ent", "Label", "Lionsgate since 2012 (Twilight)"),
 }
 COMPANY_TYPES = ["Label", "Producer", "Co-financier", "Animation & IP"]
-TYPE_COLOR = dict(zip(COMPANY_TYPES, [CAT[0], CAT[2], CAT[1], CAT[3]]))
 
 
 @st.cache_resource(show_spinner=False)
@@ -1032,12 +1049,12 @@ def studio_section():
         title = (f"{d.iloc[0]['Company']} leads on {measure} ({format(d.iloc[0]['Value'], f)}) vs. "
                  f"{format(allv, f)} for all films")
         def build():
-            base = alt.Chart(d).encode(y=alt.Y("Company:N", sort=list(d["Company"]), title=None))
-            bars = base.mark_bar(stroke="white", strokeWidth=1, cornerRadiusEnd=3, height={"band": 0.7}).encode(
+            # One color for every company (type is in the label), so no genre colors are borrowed here
+            dd = d.assign(Name=d["Company"] + " · " + d["Type"].str.lower().str.replace(" ip", " IP"))
+            base = alt.Chart(dd).encode(y=alt.Y("Name:N", sort=list(dd["Name"]), title=None))
+            bars = base.mark_bar(stroke="white", strokeWidth=1, cornerRadiusEnd=3, height={"band": 0.7},
+                                 color=FOCUS).encode(
                 x=alt.X("Value:Q", title=cname),
-                color=alt.Color("Type:N", scale=alt.Scale(domain=COMPANY_TYPES,
-                                                          range=[TYPE_COLOR[t] for t in COMPANY_TYPES]),
-                                legend=alt.Legend(orient="top", title=None)),
                 tooltip=["Company", "Type", "Home", alt.Tooltip("Value:Q", format=f, title=cname), "Films"])
             text = base.mark_text(align="left", dx=5, fontSize=11, color=INK).encode(
                 x="Value:Q", text=alt.Text("Value:Q", format=f))
@@ -1102,7 +1119,7 @@ def studio_section():
                     y=alt.Y("Genre:N", sort=GENRES, title=None),
                     yOffset=alt.YOffset("Series:N", sort=[one, "All films"]),
                     x=alt.X("Share:Q", title="% of films"),
-                    color=alt.Color("Series:N", scale=alt.Scale(domain=[one, "All films"], range=[BLUE, SOFT]),
+                    color=alt.Color("Series:N", scale=alt.Scale(domain=[one, "All films"], range=[FOCUS, COMPARE]),
                                     legend=alt.Legend(orient="top", title=None)),
                     tooltip=["Series", "Genre", alt.Tooltip("Share:Q", format=".0f", title="% of films")]
                 ).properties(height=40 * len(GENRES))
@@ -1270,12 +1287,12 @@ def fatigue_section():
             x=alt.X("decade:N", title=None, axis=alt.Axis(labelAngle=0)),
             xOffset=alt.XOffset("kind:N", sort=kinds),
             y=alt.Y("median:Q", title="Median % of week-1 gross lost in week 2"),
-            color=alt.Color("kind:N", sort=kinds, scale=alt.Scale(domain=kinds, range=[SOFT, BLUE]),
+            color=alt.Color("kind:N", sort=kinds, scale=alt.Scale(domain=kinds, range=[COMPARE, FOCUS]),
                             legend=alt.Legend(orient="top", title=None)),
             tooltip=[alt.Tooltip("decade:N", title="Decade"), alt.Tooltip("kind:N", title="Film"),
                      alt.Tooltip("median:Q", format=".0f", title="Median drop (%)"),
                      alt.Tooltip("count:Q", title="Films")])
-        labels = bars.mark_text(dy=-7, fontSize=11, color=INK).encode(text=alt.Text("median:Q", format=".0f"))
+        labels = bars.mark_text(dy=-7, fontSize=11).encode(text=alt.Text("median:Q", format=".0f"), color=alt.value(INK))
         return (bars + labels).properties(height=310)
     show_chart(build, title, "Median week-1 to week-2 drop, wide releases, by decade")
     st.caption("*Wide releases only (600+ opening theaters), decades with at least 5 films per group. The drop is week 1 "
@@ -1423,7 +1440,7 @@ def script_section():
     def build():
         return alt.Chart(arcs).mark_line(point=line_points(), strokeWidth=2.25).encode(
             x=act_axis(), y=alt.Y("Share:Q", title=f"% of dialogue read as {emo2.lower()}"),
-            color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[BLUE, INK]),
+            color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[GOOD, BAD]),
                             legend=alt.Legend(orient="top", title=None)),
             tooltip=["Group", "Act", alt.Tooltip("Share:Q", format=".1f", title="% of dialogue")]
         ).properties(height=290)
@@ -1497,8 +1514,8 @@ def ci_bars(d, order, colors, ytitle):
         tooltip=["Group", alt.Tooltip("Mean:Q", format="+.2f", title="Average (%)"),
                  alt.Tooltip("Low:Q", format="+.2f", title="95% CI low"),
                  alt.Tooltip("High:Q", format="+.2f", title="95% CI high"), "Films"])
-    whisk = base.mark_rule(color="#4b5563", strokeWidth=1.5).encode(y="Low:Q", y2="High:Q")
-    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#9ca3af").encode(y="y:Q")
+    whisk = base.mark_rule(color=KEYLINE, strokeWidth=1.5).encode(y="Low:Q", y2="High:Q")
+    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=RULE).encode(y="y:Q")
     return (bars + whisk + zero).properties(height=290)
 
 
@@ -1540,7 +1557,7 @@ def wallstreet_section():
     r = pd.DataFrame(recs).set_index("Group")
     title = (f"Parent stocks moved {r.loc['Hits (top 25% return)', 'Mean']:+.2f}% after hits vs. "
              f"{r.loc['Misses (bottom 25% return)', 'Mean']:+.2f}% after misses")
-    show_chart(lambda: ci_bars(r.reset_index(), list(r.index), {"Misses (bottom 25% return)": INK, "Middle 50%": SOFT,
+    show_chart(lambda: ci_bars(r.reset_index(), list(r.index), {"Misses (bottom 25% return)": BAD, "Middle 50%": COMPARE,
                                                                 "Hits (top 25% return)": BLUE},
                                "Average 5-day stock reaction (%)"),
                title, f"{stu}: parent's abnormal stock return, release day to +5 trading days, with 95% intervals")
@@ -1581,7 +1598,7 @@ def wallstreet_section():
                 x=alt.X("Quarter:N", sort=qorder, title=None, axis=alt.Axis(labelAngle=0)),
                 y=alt.Y("Tone:Q", title="Average earnings-call tone (positive − negative)",
                         scale=alt.Scale(zero=False)),
-                color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[BLUE, INK]),
+                color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[GOOD, BAD]),
                                 legend=alt.Legend(orient="top", title=None)),
                 tooltip=["Group", "Quarter", alt.Tooltip("Tone:Q", format=".3f"), "Films"]).properties(height=290)
         show_chart(build, title, f"{stu}: parent's earnings-call tone (FinBERT) around the release")
@@ -1651,7 +1668,7 @@ def wallstreet_section():
                 x=alt.X("Quarter:N", sort=qorder, title=None, axis=alt.Axis(labelAngle=0)),
                 y=alt.Y("Value:Q", title=f"Average parent {metric if metric == 'ROA' else metric.lower()} ({unit})",
                         scale=alt.Scale(zero=False)),
-                color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[BLUE, INK]),
+                color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[GOOD, BAD]),
                                 legend=alt.Legend(orient="top", title=None)),
                 tooltip=["Group", "Quarter", alt.Tooltip("Value:Q", format=".2f"), "Films"]).properties(height=290)
         show_chart(build,
@@ -1832,11 +1849,11 @@ def predict_section():
                 x=alt.X("Data:N", sort=[LAYER_SHORT[l] for l in LAYERS], title=None, axis=alt.Axis(labelAngle=0)),
                 xOffset=alt.XOffset("Model:N", sort=MODEL_NAMES),
                 y=alt.Y("R²:Q", title="Cross-validated R²"),
-                color=alt.Color("Model:N", sort=MODEL_NAMES, scale=alt.Scale(domain=MODEL_NAMES, range=CAT[:3]),
+                color=alt.Color("Model:N", sort=MODEL_NAMES, scale=alt.Scale(domain=MODEL_NAMES, range=RAMP3),
                                 legend=alt.Legend(orient="top", title=None)),
                 tooltip=["Data", "Model", alt.Tooltip("R²:Q", format=".2f"), "Films"])
-            return (bars + bars.mark_text(dy=-7, fontSize=10, color=INK).encode(
-                text=alt.Text("R²:Q", format=".2f"))).properties(height=290)
+            return (bars + bars.mark_text(dy=-7, fontSize=10).encode(
+                text=alt.Text("R²:Q", format=".2f"), color=alt.value(INK))).properties(height=290)
         show_chart(build, title,
                    f"{scope}, {out_l}: share of variation explained on unseen films (1 = perfect, 0 = no better than the average)")
         full = MODELS.get(f"{scope}|{outcome}|{LAYERS[2]}", {})
@@ -1890,7 +1907,7 @@ def predict_section():
                 y=alt.Y("Actual:Q", scale=alt.Scale(type="log"), title="Actual" + axis_t),
                 tooltip=["Film", alt.Tooltip("Actual:Q", format=",.1f"), alt.Tooltip("Predicted:Q", format=",.1f")])
             diag = alt.Chart(pd.DataFrame({"x": [lo, hi], "y": [lo, hi]})).mark_line(
-                color="#9ca3af", strokeDash=[5, 4]).encode(x="x:Q", y="y:Q")
+                color=RULE, strokeDash=[5, 4]).encode(x="x:Q", y="y:Q")
             return (diag + pts).properties(height=330)
         show_chart(build,
                    f"{within2:.0f}% of unseen films land within 2× of the prediction",
@@ -1902,7 +1919,7 @@ def predict_section():
                 x=alt.X("Predicted:Q", scale=alt.Scale(type="log"), title="Predicted" + axis_t),
                 y=alt.Y("Ratio:Q", scale=alt.Scale(type="log"), title="Actual ÷ predicted (log scale)"),
                 tooltip=["Film", alt.Tooltip("Ratio:Q", format=".2f", title="Actual ÷ predicted")])
-            one = alt.Chart(pd.DataFrame({"y": [1]})).mark_rule(color="#9ca3af", strokeDash=[5, 4]).encode(y="y:Q")
+            one = alt.Chart(pd.DataFrame({"y": [1]})).mark_rule(color=RULE, strokeDash=[5, 4]).encode(y="y:Q")
             return (one + res).properties(height=330)
         show_chart(build, f"The typical miss is a factor of {miss:.1f} either way",
                    f"Residuals: actual ÷ predicted, {mpick.lower()}")
@@ -1962,11 +1979,11 @@ def render_importance(rows, title, subtitle):
                     title="← Negative association   |   Random forest importance   |   Positive association →",
                     axis=alt.Axis(labelExpr="format(abs(datum.value), '.2f')")),
             color=alt.Color("Direction:N", scale=alt.Scale(domain=["Positive association", "Negative association"],
-                                                           range=[BLUE, INK]),
+                                                           range=[GOOD, BAD]),
                             legend=alt.Legend(orient="top", title=None)),
             tooltip=["Feature", alt.Tooltip("Importance:Q", format=".3f"),
                      alt.Tooltip("Effect %:Q", format="+.1f", title="Effect on outcome (%)")])
-        zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#9ca3af").encode(x="x:Q")
+        zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color=RULE).encode(x="x:Q")
         pos = base.transform_filter("datum.Signed >= 0").mark_text(align="left", dx=4, fontSize=11, color=INK).encode(
             x="Signed:Q", text=alt.Text("Importance:Q", format=".3f"))
         neg = base.transform_filter("datum.Signed < 0").mark_text(align="right", dx=-4, fontSize=11, color=INK).encode(
@@ -2076,10 +2093,11 @@ def waterfall(rows):
             lo, hi = run, run + v
             run += v
         recs.append({"Step": label, "Low": min(lo, hi), "High": max(lo, hi), "Amount": v,
-                     "Kind": kind if kind in ("start", "total") else ("up" if v >= 0 else "down")})
+                     "Kind": "start" if kind == "start" else ("total" if v >= 0 else "loss") if kind == "total"
+                     else ("up" if v >= 0 else "down")})
     d = pd.DataFrame(recs)
     order = list(d["Step"])
-    colors = {"start": SOFT, "up": BLUE, "down": INK, "total": CAT[2]}
+    colors = {"start": COMPARE, "up": GOOD, "down": BAD, "total": GOOD, "loss": BAD}
     base = alt.Chart(d).encode(x=alt.X("Step:N", sort=order, title=None, axis=alt.Axis(labelAngle=0, labelLimit=110)))
     bars = base.mark_bar(size=44, cornerRadius=2).encode(
         y=alt.Y("Low:Q", title="$M"), y2="High:Q",
@@ -2087,7 +2105,7 @@ def waterfall(rows):
         tooltip=["Step", alt.Tooltip("Amount:Q", format="+,.1f", title="$M")])
     text = base.mark_text(dy=-8, fontSize=11, color=INK).encode(
         y="High:Q", text=alt.Text("Amount:Q", format=",.0f"))
-    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#6b7280").encode(y="y:Q")
+    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=RULE).encode(y="y:Q")
     return (bars + text + zero).properties(height=320)
 
 
@@ -2145,7 +2163,8 @@ def money_sections():
                f"({money(r['Theatrical profit'])} from theaters alone)",
                f"Estimated studio P&L, $M, under your assumptions ({r['multiple']:.2f}× budget at the box office)")
     st.caption("*Gray = what the box office took in; black = what's paid out or kept by others; blue = later windows; "
-               "green = what's left for the studio. An estimate: real deals add distribution fees, talent "
+               "the last bar = what's left for the studio (blue if it made money, black if it lost money). An "
+               "estimate: real deals add distribution fees, talent "
                "participations (gross points), co-financier shares and overhead, which all shrink the studio's share.*")
 
     section("Studios & money", "Who's Winning",
@@ -2172,7 +2191,7 @@ def money_sections():
                                                                          labelFontWeight=600)),
             xOffset=alt.XOffset("Window:N", sort=wins),
             y=alt.Y("Share:Q", title="% of films profitable", scale=alt.Scale(domain=[0, 100])),
-            color=alt.Color("Window:N", sort=wins, scale=alt.Scale(domain=wins, range=[SOFT, BLUE]),
+            color=alt.Color("Window:N", sort=wins, scale=alt.Scale(domain=wins, range=[COMPARE, FOCUS]),
                             legend=alt.Legend(orient="top", title=None)),
             tooltip=["Studio", "Window", alt.Tooltip("Share:Q", format=".0f", title="% profitable"), "Films"]
         ).properties(height=300)
@@ -2201,7 +2220,7 @@ def money_sections():
         base = alt.Chart(rt).encode(y=alt.Y("Tier:N", sort=tiers, title=None),
                                     yOffset=alt.YOffset("Kind:N", sort=kinds),
                                     color=alt.Color("Kind:N", sort=kinds,
-                                                    scale=alt.Scale(domain=kinds, range=[BLUE, CAT[1]]),
+                                                    scale=alt.Scale(domain=kinds, range=[COMPARE, FOCUS]),
                                                     legend=alt.Legend(orient="top", title=None)))
         tip = ["Tier", "Kind", alt.Tooltip("P10:Q", format=",.0f", title="Bad case (10th pct) $M"),
                alt.Tooltip("P50:Q", format=",.0f", title="Typical (median) $M"),
@@ -2211,7 +2230,7 @@ def money_sections():
             x=alt.X("P10:Q", title="Estimated full-cycle profit ($M)"), x2="P90:Q", tooltip=tip)
         mid = base.mark_point(filled=True, size=140, stroke="white", strokeWidth=1.5, opacity=1).encode(
             x="P50:Q", tooltip=tip)
-        zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#6b7280", strokeDash=[4, 3]).encode(x="x:Q")
+        zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color=RULE, strokeDash=[4, 3]).encode(x="x:Q")
         return (zero + rng + mid).properties(height=260)
     if len(rt):
         big = rt[rt["Tier"] == "$150M+"]
@@ -2302,12 +2321,12 @@ def pitch_section():
                                             axis=alt.Axis(labelAngle=0, labelLimit=150)))
         bars = base.mark_bar(size=50, cornerRadiusEnd=3).encode(
             y=alt.Y("Profit:Q", title="Estimated studio profit ($M)"),
-            color=alt.condition("datum.Profit >= 0", alt.value(BLUE), alt.value(INK)),
+            color=alt.condition("datum.Profit >= 0", alt.value(GOOD), alt.value(BAD)),
             tooltip=["Case", alt.Tooltip("Gross:Q", format="$,.0f", title="Worldwide gross"),
                      alt.Tooltip("Profit:Q", format="+,.0f", title="Profit ($M)")])
         lab = base.mark_text(fontSize=11, color=INK, dy=-8).encode(y=alt.Y("Profit:Q"),
                                                                    text=alt.Text("Profit:Q", format="+,.0f"))
-        zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#6b7280").encode(y="y:Q")
+        zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=RULE).encode(y="y:Q")
         return (bars + lab + zero).properties(height=300)
     show_chart(build,
                f"{p_win:.0f}% chance of profit: loses money in the weak case" if profit(lo50) < 0
