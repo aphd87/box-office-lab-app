@@ -3,17 +3,21 @@
 
 Everything is precomputed by build_data.py into data/ (cleaned films, prediction models, studio market share), so a
 click only filters a ~1,000-row table or reads a stored model. Nothing is fitted while students use the app. Charts
-are Vega-Lite (drawn in the student's browser), so a full class clicking at once costs the server very little.
+are Vega-Lite (drawn in the student's browser), but building them in Altair is the server's main cost, so every chart
+is built once per distinct set of inputs and shared by all sessions (see show_chart). Load-tested for 65 students.
 
 On the Hugging Face Space, data/ is not shipped with the code: it is pulled at startup from the private dataset named
 in DATA_REPO using the HF_TOKEN secret, and APP_PASSWORD (also a secret) gates the app. Locally, data/ is read as is
 and there is no password unless APP_PASSWORD is set.
 """
+import hashlib
 import hmac
 import inspect
 import json
 import math
 import os
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 import altair as alt
@@ -23,6 +27,24 @@ import streamlit as st
 
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "data"
+
+
+# --- Classroom load: skip Altair's schema check ----------------------------------------------------------------
+# Altair re-validates every chart against the full Vega-Lite JSON schema each time it is drawn, for every student,
+# which was the biggest single CPU cost in a 65-student load test. These charts are fixed code, already validated
+# while building the app, so draw them without the check. Guarded so reruns don't stack wrappers.
+def _skip_altair_validation():
+    for cls in (alt.Chart, alt.TopLevelMixin):
+        if "to_dict" in cls.__dict__ and not getattr(cls.to_dict, "_no_validate", False):
+            orig = cls.to_dict
+
+            def to_dict(self, validate=False, *args, _orig=orig, **kw):
+                return _orig(self, validate, *args, **kw)
+            to_dict._no_validate = True
+            cls.to_dict = to_dict
+
+
+_skip_altair_validation()
 
 st.set_page_config(page_title="Behind the Box Office Lab", page_icon="🎬", layout="wide",
                    initial_sidebar_state="collapsed")
@@ -61,10 +83,14 @@ SEASON_ORDER = ["Winter", "Spring", "Summer", "Fall", "Holiday"]
 HIT_MULTIPLE = 2.5
 
 # One long page: section title -> anchor. Order here is the order on the page and in the menus.
-NAV = {"Studio Playbooks": "studios", "Trends & Franchise Fatigue": "trends", "Script DNA": "scripts",
-       "Film Economics": "economics", "Pitch a Film": "pitch", "Wall Street & Parent Companies": "parents",
-       "Predict the Box Office": "predict", "Movie Database": "database"}
+# The first CLASS_STOPS sections follow the Class 7 teaching plan's three dashboard visits in order (money, who's
+# winning, franchise fatigue), so students answer each stop by scrolling down; the rest is the "go deeper" lab.
+NAV = {"Film Economics": "economics", "Who's Winning": "winning", "Franchise Fatigue": "fatigue",
+       "Studio Playbooks": "studios", "Trends & Calendar": "trends", "Script DNA": "scripts",
+       "Pitch a Film": "pitch", "Wall Street & Parent Companies": "parents", "Predict the Box Office": "predict",
+       "Movie Database": "database"}
 NAV_NUM = {t: str(i) for i, t in enumerate(NAV, start=1)}
+CLASS_STOPS = 3
 
 
 # --- Definitions on hover ---------------------------------------------------------------------------------------
@@ -201,6 +227,10 @@ div[data-testid="stElementContainer"]:has(.navbar), div.element-container:has(.n
              border-radius: 999px; padding: .28rem .8rem; background: #fff; }}
 .navbar a:hover {{ border-color: {BLUE}; color: {BLUE}; }}
 .navbar a b {{ color: {BLUE}; margin-right: .3rem; }}
+.navbar .navsep {{ font-size: .72rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+                   color: {MUTED}; align-self: center; margin: 0 .2rem 0 .5rem; }}
+.deeper {{ margin: 3.6rem 0 0; padding: .9rem 1.1rem; border: 1px dashed #cbd5e1; border-radius: 8px;
+           color: {MUTED}; background: #fafbfc; }}
 section[data-testid="stSidebar"] a {{ text-decoration: none; color: {INK}; }}
 [data-testid="stIconMaterial"], .material-symbols-rounded, [class*="material-symbols"] {{
     font-family: 'Material Symbols Rounded' !important; }}
@@ -212,6 +242,7 @@ section[data-testid="stSidebar"] a {{ text-decoration: none; color: {INK}; }}
 
 # st.dataframe takes width="stretch" from Streamlit 1.46; older versions (e.g. a local 1.45) need use_container_width
 _NEW_WIDTH = tuple(int(x) for x in st.__version__.split(".")[:2]) >= (1, 46)
+_LAZY_DOWNLOAD = tuple(int(x) for x in st.__version__.split(".")[:2]) >= (1, 67)   # download_button(data=callable)
 
 
 def _stretch(fn):
@@ -239,10 +270,97 @@ def show_table(df, column_config=None, **kw):
 PANEL, SOFT = "#eaeaf2", "#9aa3b2"     # seaborn "darkgrid": gray-blue panel, white grid; SOFT = comparison bars
 
 
-def show_chart(chart, title=None, subtitle=None, panel=True):
+# --- Shared chart cache -------------------------------------------------------------------------------------------
+# Building an Altair chart and converting it to Vega-Lite costs ~20-80 ms of server CPU, and a full page draws 29 of
+# them. With 65 students on one shared CPU that queued page loads for over a minute (load test, 2026-11-11). So each
+# chart is passed in as a small build() function, and its finished spec is cached server-wide, keyed on everything
+# build() can see: the call site plus the values it closes over (DataFrames by content hash). Two students with the
+# same selections get the same key and the second one skips the work. Different selections mean a different key, so
+# a student can never be shown someone else's chart.
+try:  # Streamlit's own Altair -> Vega-Lite step, so cached charts are byte-identical to st.altair_chart
+    from streamlit.elements.vega_charts import _convert_altair_to_vega_lite_spec as _altair_to_spec
+except Exception:  # renamed in some future Streamlit: fall back to plain st.altair_chart, uncached
+    _altair_to_spec = None
+CHART_CACHE_MAX = 1500      # specs are small (a few KB to ~100 KB); this caps memory at well under 200 MB
+
+
+@st.cache_resource(show_spinner=False)
+def _chart_store():
+    return OrderedDict(), threading.Lock()
+
+
+def _fingerprint(v):
+    """A hashable stand-in for v that changes whenever v's content does."""
+    if isinstance(v, (pd.DataFrame, pd.Series)):
+        try:
+            raw = pd.util.hash_pandas_object(v, index=True).values.tobytes()
+        except TypeError:   # unhashable cells (e.g. lists)
+            raw = v.to_json(default_handler=str).encode()
+        meta = (tuple(map(str, v.columns)), tuple(map(str, v.dtypes))) if isinstance(v, pd.DataFrame) \
+            else (str(v.name), str(v.dtype))
+        return (type(v).__name__, meta, hashlib.md5(raw).hexdigest())
+    if isinstance(v, pd.Index):
+        return ("Index", _fingerprint(list(v)))
+    if isinstance(v, np.ndarray):
+        return ("ndarray", v.dtype.str, v.shape, hashlib.md5(np.ascontiguousarray(v).tobytes()).hexdigest())
+    if isinstance(v, (list, tuple, set, frozenset)):
+        items = sorted(map(repr, v)) if isinstance(v, (set, frozenset)) else v
+        return (type(v).__name__, tuple(_fingerprint(x) for x in items))
+    if isinstance(v, dict):
+        return ("dict", tuple((repr(k), _fingerprint(x)) for k, x in v.items()))
+    if inspect.isfunction(v):
+        return _builder_key(v)
+    return (type(v).__name__, repr(v))
+
+
+def _builder_key(fn):
+    code = fn.__code__
+    return (code.co_filename, code.co_firstlineno, getattr(code, "co_qualname", code.co_name),
+            tuple(_fingerprint(c.cell_contents) for c in (fn.__closure__ or ())), _fingerprint(fn.__defaults__))
+
+
+def show_chart(build, title=None, subtitle=None, panel=True):
     """House style for every chart, after seaborn's darkgrid: a soft gray-blue panel with white gridlines, no axis
     lines or ticks. The heading names the measure (subtitle); the insight (title) goes in an Insight box under the
-    chart, so every chart ends with its answer. Heatmaps pass panel=False (white background, as in seaborn)."""
+    chart, so every chart ends with its answer. Heatmaps pass panel=False (white background, as in seaborn).
+
+    build is a no-argument function returning the Altair chart (cached across sessions, see above); a chart object
+    also works but is drawn uncached. build() must only use values it closes over plus this module's constants."""
+    is_fn = inspect.isfunction(build)
+    key = None
+    if is_fn and _altair_to_spec is not None:
+        try:
+            key = (_builder_key(build), title, subtitle, panel)
+        except Exception:
+            key = None
+    store, lock = _chart_store()
+    hit = None
+    if key is not None:
+        with lock:
+            hit = store.get(key)
+            if hit is not None:
+                store.move_to_end(key)
+    if hit is None:
+        chart = _house_style(build() if is_fn else build, title, subtitle, panel)
+        if key is None:
+            st.altair_chart(chart, theme=None, **_stretch(st.altair_chart))
+        else:
+            spec = _altair_to_spec(chart)
+            datasets = spec.pop("datasets", None) or {}
+            hit = (json.dumps(spec), datasets)
+            with lock:
+                store[key] = hit
+                while len(store) > CHART_CACHE_MAX:
+                    store.popitem(last=False)
+    if hit is not None:
+        spec = json.loads(hit[0])          # a fresh dict each time: Streamlit edits the spec it is given
+        spec["datasets"] = dict(hit[1])    # Arrow bytes, passed through as is
+        st.vega_lite_chart(spec, theme=None, **_stretch(st.vega_lite_chart))
+    if title and subtitle:
+        takeaway(f"<b>Insight:</b> {title}")
+
+
+def _house_style(chart, title, subtitle, panel):
     if subtitle or title:
         chart = chart.properties(title=alt.TitleParams(text=subtitle or title, anchor="start"))
     grid = dict(grid=True, gridColor="white", gridWidth=1.2, domain=False, ticks=False)
@@ -257,9 +375,7 @@ def show_chart(chart, title=None, subtitle=None, panel=True):
              .configure_axisDiscrete(grid=False)
              .configure_legend(labelFontSize=11, labelColor="#374151", symbolType="circle", symbolSize=80,
                                titleFontSize=11, titleColor=MUTED, columnPadding=14))
-    st.altair_chart(chart, theme=None, **_stretch(st.altair_chart))
-    if title and subtitle:
-        takeaway(f"<b>Insight:</b> {title}")
+    return chart
 
 
 def section(kicker, title, how):
@@ -479,13 +595,15 @@ c2.markdown("**The Solution**  \n"
             "theatrical run), the **studio** (playbooks and market share), the **script** (the emotional arc of the "
             "dialogue, measured with NLP across five acts) and the **parent company** (how Wall Street and the "
             "quarter's financials responded). Use it to build the evidence behind your Bottom Line Up Front.")
-st.markdown("<div class='navbar'>" + "".join(f"<a href='#{a}'><b>{NAV_NUM[t]}</b>{t}</a>" for t, a in NAV.items())
+_pills = [f"<a href='#{a}'><b>{NAV_NUM[t]}</b>{t}</a>" for t, a in NAV.items()]
+st.markdown("<div class='navbar'><span class='navsep' style='margin-left:0'>In class</span>"
+            + "".join(_pills[:CLASS_STOPS]) + "<span class='navsep'>Go deeper</span>" + "".join(_pills[CLASS_STOPS:])
             + "</div>", unsafe_allow_html=True)
 st.caption("Hover any number, column header or ⓘ for its definition. Section menu and full glossary: the › arrow at "
            "the top left.")
 
 
-# --- 1. Movie Database --------------------------------------------------------------------------------------------
+# --- 10. Movie Database --------------------------------------------------------------------------------------------
 @st.fragment
 def database_section():
     section("Films", "Movie Database",
@@ -534,7 +652,9 @@ def database_section():
     })
     st.caption(f"*{len(v):,} of {len(FILMS):,} films match. A negative week-2 drop means the gross grew (usually a "
                f"platform release expanding). Sources: The Numbers, Box Office Mojo, TMDB.*")
-    st.download_button(f"⬇ Download these {len(v):,} films (CSV)", csv_bytes(v), "box_office_lab_films.csv",
+    # On Streamlit 1.67+ the CSV is built only when someone clicks, not on every page load for every student.
+    st.download_button(f"⬇ Download these {len(v):,} films (CSV)",
+                       (lambda: csv_bytes(v)) if _LAZY_DOWNLOAD else csv_bytes(v), "box_office_lab_films.csv",
                        "text/csv", on_click="ignore")
 
     exhibit("Film profile")
@@ -622,15 +742,19 @@ def render_profile(r):
             top = mine.loc[mine["gap"].abs().idxmax()]
             title = (f"Most distinctive beat: {top['gap']:+.1f} pts of {top['Emotion'].lower()} in Act {int(top['Act'])} "
                      f"vs. the typical {r['genre'].lower()} film")
-            chart = alt.Chart(d).mark_line(point=line_points(), strokeWidth=2.25).encode(
-                x=act_axis(), y=alt.Y("Share:Q", title="% of the act's dialogue"),
-                color=alt.Color("Emotion:N", scale=alt.Scale(domain=picked, range=[EMOTION_COLOR[e] for e in picked]),
-                                legend=alt.Legend(orient="top", title=None)),
-                strokeDash=alt.StrokeDash("Series:N", scale=alt.Scale(domain=["This film", f"{r['genre']} average"],
-                                                                      range=[[1, 0], [5, 4]]),
-                                          legend=alt.Legend(orient="top", title=None)),
-                tooltip=["Emotion", "Series", "Act", alt.Tooltip("Share:Q", format=".1f", title="% of dialogue")])
-            show_chart(chart.properties(height=330), title, "Emotional arc of the script, % of each act's dialogue")
+            genre = r["genre"]
+
+            def build():
+                return alt.Chart(d).mark_line(point=line_points(), strokeWidth=2.25).encode(
+                    x=act_axis(), y=alt.Y("Share:Q", title="% of the act's dialogue"),
+                    color=alt.Color("Emotion:N", scale=alt.Scale(domain=picked, range=[EMOTION_COLOR[e] for e in picked]),
+                                    legend=alt.Legend(orient="top", title=None)),
+                    strokeDash=alt.StrokeDash("Series:N", scale=alt.Scale(domain=["This film", f"{genre} average"],
+                                                                          range=[[1, 0], [5, 4]]),
+                                              legend=alt.Legend(orient="top", title=None)),
+                    tooltip=["Emotion", "Series", "Act", alt.Tooltip("Share:Q", format=".1f", title="% of dialogue")]
+                ).properties(height=330)
+            show_chart(build, title, "Emotional arc of the script, % of each act's dialogue")
             st.caption("*Solid = this film; dashed = the average film in its genre. Each point is the share of that act's "
                        "dialogue an NLP emotion model reads as that emotion. Acts follow the classic five-part "
                        "structure: exposition, rising action, climax, falling action, resolution.*")
@@ -641,7 +765,7 @@ def render_profile(r):
         show_comps(comps(r["genre"], r["budget"], r["follow_up"], r["year"], exclude=r["id"]))
 
 
-# --- 2. Studio Playbooks --------------------------------------------------------------------------------------------
+# --- 2 (market share) and 4. Studio Playbooks ----------------------------------------------------------------------
 YEARLY = {  # measure: (column, number format, axis title, multiplier)
     "Market share (%)": ("Share", ".1f", "Share of US box office (%)", 100),
     "Total US gross ($M)": ("Gross", ",.0f", "US box office ($M, nominal)", 1e-6),
@@ -717,6 +841,64 @@ def h2h_value(d, col, how):
     return median(d[col]) if how == "median" else d[col].mean() * 100
 
 
+# Studio tables that depend only on widget values: computed once per distinct selection and shared by every session
+# (st.cache_data hands each caller its own copy). Filtering the wide film table ~100 times per rerun was the largest
+# remaining cost in the load test.
+@st.cache_data(show_spinner=False, max_entries=500)
+def h2h_table(col, how, g, pick):
+    recs = []
+    for (p, stu), d in FILMS[FILMS["studio"].isin(pick)].groupby([g, "studio"]):
+        n = int(d[col].notna().sum()) if col != "drop2" else int(d.loc[d["wide"] == 1, col].notna().sum())
+        if n >= 3:
+            recs.append({"Period": p, "Studio": stu, "Value": h2h_value(d, col, how), "Films": n})
+    overall = pd.Series({stu: h2h_value(FILMS[FILMS["studio"] == stu], col, how) for stu in pick})
+    return pd.DataFrame(recs), overall
+
+
+@st.cache_data(show_spinner=False, max_entries=500)
+def company_values(col, how, picks):
+    members = company_members()
+    return pd.DataFrame([{"Company": k, "Type": COMPANIES[k][1], "Home": COMPANIES[k][2], "Films": len(members[k]),
+                          "Value": h2h_value(FILMS.loc[members[k]], col, how)} for k in picks]).dropna(subset=["Value"])
+
+
+@st.cache_data(show_spinner=False)
+def studio_scorecard():
+    rows = []
+    for stu in STUDIOS:
+        d = FILMS[FILMS["studio"] == stu]
+        rows.append({"Studio": stu, "Films": len(d), "Median budget ($M)": median(d["budget_m"]),
+                     "Median worldwide ($M)": median(d["worldwide_m"]), "Median return (×)": median(d["multiple"]),
+                     f"Hit rate (≥{HIT_MULTIPLE}×)": d["hit"].mean() * 100, "Follow-ups (%)": d["follow_up"].mean() * 100,
+                     "Median week-2 drop (%)": median(d.loc[d["wide"] == 1, "drop2"]), "Median IMDb": median(d["imdb"])})
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False)
+def studio_genre_grid(is_share):
+    recs = []
+    for stu in STUDIOS:
+        d = FILMS[FILMS["studio"] == stu]
+        for g in GENRES:
+            dg = d[d["genre"] == g]
+            if is_share:
+                recs.append({"Studio": stu, "Genre": g, "Value": len(dg) / len(d) * 100, "n": len(dg)})
+            elif len(dg) >= 3:
+                recs.append({"Studio": stu, "Genre": g, "Value": median(dg["multiple"]), "n": len(dg)})
+    return pd.DataFrame(recs)
+
+
+@st.cache_data(show_spinner=False)
+def studio_month_grid():
+    recs = []
+    for stu in STUDIOS:
+        d = FILMS[FILMS["studio"] == stu]
+        for i, m in enumerate(MONTHS, start=1):
+            n = int((d["month"] == i).sum())
+            recs.append({"Studio": stu, "Month": m, "Value": n / len(d) * 100, "n": n})
+    return pd.DataFrame(recs)
+
+
 def studio_lines(d, x, y, pick, tooltip, point_size=60):
     """One line per studio in its own color, labeled at its last point (no legend to decode). Universal is drawn
     heavier; Paramount's white line sits on a charcoal keyline."""
@@ -747,54 +929,61 @@ def heatmap(d, x, y, x_order, y_order, legend_title, fmt_str):
     return (rect + text).properties(height=36 * len(y_order) + 24)
 
 
-@st.fragment
-def studio_section():
-    section("Studios", "Studio Playbooks",
-            "**How it works:** compare the studios year by year on their full slates, then head to head on the films "
-            "in this dataset: what each one makes, when it releases, and how it pays off. Each studio keeps its own "
-            "color throughout, with Universal in NBCU purple.")
-
-    if SHARE is not None:
-        exhibit("Studio vs. studio, year by year (full slates, 1995–2023)")
-        avail = [s for s in STUDIO_ORDER if s in set(SHARE["Studio"])]
-        c1, c2, c3 = st.columns([2, 3, 1])
-        yname = c1.selectbox("Measure", list(YEARLY), key="yearly_metric",
-                             help="  \n".join(f"**{k}**: {v}" for k, v in YEARLY_NOTES.items()))
-        pick = c2.multiselect("Studios", avail, default=avail, key="yearly_studios")
-        smooth = c3.toggle("3-year average", value=False, key="yearly_smooth",
-                           help="Single years swing with one franchise release; smoothing shows the underlying trend.")
-        if pick:
-            col, f, ytitle, mult = YEARLY[yname]
-            s = SHARE[SHARE["Studio"].isin(pick)].sort_values("Year").copy()
-            s["Value"] = s[col] * mult
-            if smooth:
-                s["Value"] = s.groupby("Studio")["Value"].transform(lambda x: x.rolling(3, min_periods=1, center=True).mean())
-            last_year = int(s["Year"].max())
-            avg = s[s["Year"] >= last_year - 4].groupby("Studio")["Value"].mean().sort_values(ascending=False)
-            title = f"{avg.index[0]} leads on {yname.split(' (')[0].lower()} over {last_year - 4}–{last_year} " \
-                    f"({format(avg.iloc[0], f)})"
-            if "Universal" in avg.index and avg.index[0] != "Universal":
-                title += f"; Universal ranks #{list(avg.index).index('Universal') + 1} ({format(avg['Universal'], f)})"
-            chart = studio_lines(
+@st.fragment   # nested inside money_sections: its widgets rerun only this chart, not the deal math
+def studio_share_chart():
+    """Full-slate US market share by studio and year (Who's Winning, teaching-plan Group A)."""
+    if SHARE is None:
+        return
+    exhibit("Studio vs. studio, year by year (full slates, 1995–2023)")
+    avail = [s for s in STUDIO_ORDER if s in set(SHARE["Studio"])]
+    c1, c2, c3 = st.columns([2, 3, 1])
+    yname = c1.selectbox("Measure", list(YEARLY), key="yearly_metric",
+                         help="  \n".join(f"**{k}**: {v}" for k, v in YEARLY_NOTES.items()))
+    pick = c2.multiselect("Studios", avail, default=avail, key="yearly_studios")
+    smooth = c3.toggle("3-year average", value=False, key="yearly_smooth",
+                       help="Single years swing with one franchise release; smoothing shows the underlying trend.")
+    if pick:
+        col, f, ytitle, mult = YEARLY[yname]
+        s = SHARE[SHARE["Studio"].isin(pick)].sort_values("Year").copy()
+        s["Value"] = s[col] * mult
+        if smooth:
+            s["Value"] = s.groupby("Studio")["Value"].transform(lambda x: x.rolling(3, min_periods=1, center=True).mean())
+        last_year = int(s["Year"].max())
+        avg = s[s["Year"] >= last_year - 4].groupby("Studio")["Value"].mean().sort_values(ascending=False)
+        title = f"{avg.index[0]} leads on {yname.split(' (')[0].lower()} over {last_year - 4}–{last_year} " \
+                f"({format(avg.iloc[0], f)})"
+        if "Universal" in avg.index and avg.index[0] != "Universal":
+            title += f"; Universal ranks #{list(avg.index).index('Universal') + 1} ({format(avg['Universal'], f)})"
+        def build():
+            return studio_lines(
                 s, alt.X("Year:Q", axis=alt.Axis(format="d", tickCount=8), title=None,
                          scale=alt.Scale(domain=[1995, last_year + 3])),
                 alt.Y("Value:Q", title=ytitle), pick, point_size=28,
                 tooltip=["Studio", alt.Tooltip("Year:Q", format="d"), alt.Tooltip("Value:Q", format=f, title=yname),
-                         alt.Tooltip("Films:Q", title="Films in release"), alt.Tooltip("Top film:N", title="Top film that year")])
-            show_chart(chart.properties(height=360), title,
-                       f"{ytitle}{', 3-year rolling average' if smooth else ''}")
-            st.caption(f"*{YEARLY_NOTES[yname]} Every release by each studio that year, not just the films in this "
-                       f"dataset. Hover a point for that year's top film. Source: The Numbers, via the case's Excel "
-                       f"file (Fox and Lionsgate not included).*")
+                         alt.Tooltip("Films:Q", title="Films in release"),
+                         alt.Tooltip("Top film:N", title="Top film that year")]).properties(height=360)
+        show_chart(build, title, f"{ytitle}{', 3-year rolling average' if smooth else ''}")
+        st.caption(f"*{YEARLY_NOTES[yname]} Every release by each studio that year, not just the films in this "
+                   f"dataset. Hover a point for that year's top film. Source: The Numbers, via the case's Excel "
+                   f"file (Fox and Lionsgate not included).*")
 
-            lead = SHARE.loc[SHARE.groupby("Year")["Share"].idxmax(), ["Year", "Studio", "Share", "Top film"]]
-            wins = lead["Studio"].value_counts()
-            cols = st.columns(len(wins))
-            for c, (stu, n) in zip(cols, wins.items()):
-                c.metric(f"{stu}: years as #1", f"{n}",
-                         help="Years on top of US box office share: " +
-                              ", ".join(str(y) for y in lead.loc[lead["Studio"] == stu, "Year"]))
-            st.caption("*Years (1995–2023) each studio held the largest share of US box office. Hover for the years.*")
+        lead = SHARE.loc[SHARE.groupby("Year")["Share"].idxmax(), ["Year", "Studio", "Share", "Top film"]]
+        wins = lead["Studio"].value_counts()
+        cols = st.columns(len(wins))
+        for c, (stu, n) in zip(cols, wins.items()):
+            c.metric(f"{stu}: years as #1", f"{n}",
+                     help="Years on top of US box office share: " +
+                          ", ".join(str(y) for y in lead.loc[lead["Studio"] == stu, "Year"]))
+        st.caption("*Years (1995–2023) each studio held the largest share of US box office. Hover for the years.*")
+
+
+@st.fragment
+def studio_section():
+    section("Studios", "Studio Playbooks",
+            "**How it works:** compare the studios head to head on the films in this dataset: how their films have "
+            "changed, what each one makes, when it releases, and how it pays off. (Full-slate market share year by "
+            "year is in [*Who's Winning*](#winning).) Each studio keeps its own color throughout, with Universal in "
+            "NBCU purple.")
 
     exhibit("Head-to-head: how have the studios' films changed?")
     c1, c2, c3 = st.columns([2, 3, 1])
@@ -805,23 +994,19 @@ def studio_section():
     if pick:
         col, how, f = H2H[hname]
         g = "period" if per == "5 years" else "decade"
-        recs = []
-        for (p, stu), d in FILMS[FILMS["studio"].isin(pick)].groupby([g, "studio"]):
-            n = int(d[col].notna().sum()) if col != "drop2" else int(d.loc[d["wide"] == 1, col].notna().sum())
-            if n >= 3:
-                recs.append({"Period": p, "Studio": stu, "Value": h2h_value(d, col, how), "Films": n})
-        agg = pd.DataFrame(recs)
-        overall = pd.Series({stu: h2h_value(FILMS[FILMS["studio"] == stu], col, how) for stu in pick})
+        agg, overall = h2h_table(col, how, g, tuple(pick))
         best = overall.idxmax()
         title = f"{best} is highest on {hname.split(' (')[0].lower()} across all years ({format(overall[best], f)})"
         if "Universal" in pick and best != "Universal":
             title += f"; Universal {format(overall['Universal'], f)}"
         periods = sorted(agg["Period"].unique())
-        chart = studio_lines(agg, alt.X("Period:N", sort=periods, title=None, axis=alt.Axis(labelAngle=0),
-                                        scale=alt.Scale(paddingOuter=0.35)),
-                             alt.Y("Value:Q", title=hname), pick,
-                             tooltip=["Studio", "Period", alt.Tooltip("Value:Q", format=f, title=hname), "Films"])
-        show_chart(chart.properties(height=320), title, f"{hname}, by {'5-year period' if per == '5 years' else 'decade'}")
+        def build():
+            return studio_lines(agg, alt.X("Period:N", sort=periods, title=None, axis=alt.Axis(labelAngle=0),
+                                           scale=alt.Scale(paddingOuter=0.35)),
+                                alt.Y("Value:Q", title=hname), pick,
+                                tooltip=["Studio", "Period", alt.Tooltip("Value:Q", format=f, title=hname), "Films"]
+                                ).properties(height=320)
+        show_chart(build, title, f"{hname}, by {'5-year period' if per == '5 years' else 'decade'}")
         st.caption("*Each point summarizes that studio's films from the period in this dataset; points from fewer than 3 "
                    "films are hidden (hover for counts). There are a few films per studio per year, so compare broad "
                    "directions, not small gaps.*")
@@ -841,27 +1026,27 @@ def studio_section():
                                     "Dune Entertainment", "Searchlight Pictures", "Pixar"])
     if picks:
         col, how, f = H2H[cname]
-        d = pd.DataFrame([{"Company": k, "Type": COMPANIES[k][1], "Home": COMPANIES[k][2], "Films": len(members[k]),
-                           "Value": h2h_value(FILMS.loc[members[k]], col, how)} for k in picks]).dropna(subset=["Value"])
-        d = d.sort_values("Value", ascending=False)
+        d = company_values(col, how, tuple(picks)).sort_values("Value", ascending=False)
         allv = h2h_value(FILMS, col, how)
         measure = cname.split(" (")[0].replace("Median ", "").lower()
         title = (f"{d.iloc[0]['Company']} leads on {measure} ({format(d.iloc[0]['Value'], f)}) vs. "
                  f"{format(allv, f)} for all films")
-        base = alt.Chart(d).encode(y=alt.Y("Company:N", sort=list(d["Company"]), title=None))
-        bars = base.mark_bar(stroke="white", strokeWidth=1, cornerRadiusEnd=3, height={"band": 0.7}).encode(
-            x=alt.X("Value:Q", title=cname),
-            color=alt.Color("Type:N", scale=alt.Scale(domain=COMPANY_TYPES, range=[TYPE_COLOR[t] for t in COMPANY_TYPES]),
-                            legend=alt.Legend(orient="top", title=None)),
-            tooltip=["Company", "Type", "Home", alt.Tooltip("Value:Q", format=f, title=cname), "Films"])
-        text = base.mark_text(align="left", dx=5, fontSize=11, color=INK).encode(
-            x="Value:Q", text=alt.Text("Value:Q", format=f))
-        ref = alt.Chart(pd.DataFrame({"x": [allv], "label": ["All films"]}))
-        rule = ref.mark_rule(color=INK, strokeDash=[5, 4], strokeWidth=1.5).encode(x="x:Q")
-        rlab = ref.mark_text(align="left", dx=4, dy=-4, fontSize=11, color=INK, baseline="bottom").encode(
-            x="x:Q", y=alt.value(0), text="label:N")
-        show_chart((bars + text + rule + rlab).properties(height=34 * len(d) + 30), title,
-                   f"{cname}, films credited to each company, all years; dashed line = all films")
+        def build():
+            base = alt.Chart(d).encode(y=alt.Y("Company:N", sort=list(d["Company"]), title=None))
+            bars = base.mark_bar(stroke="white", strokeWidth=1, cornerRadiusEnd=3, height={"band": 0.7}).encode(
+                x=alt.X("Value:Q", title=cname),
+                color=alt.Color("Type:N", scale=alt.Scale(domain=COMPANY_TYPES,
+                                                          range=[TYPE_COLOR[t] for t in COMPANY_TYPES]),
+                                legend=alt.Legend(orient="top", title=None)),
+                tooltip=["Company", "Type", "Home", alt.Tooltip("Value:Q", format=f, title=cname), "Films"])
+            text = base.mark_text(align="left", dx=5, fontSize=11, color=INK).encode(
+                x="Value:Q", text=alt.Text("Value:Q", format=f))
+            ref = alt.Chart(pd.DataFrame({"x": [allv], "label": ["All films"]}))
+            rule = ref.mark_rule(color=INK, strokeDash=[5, 4], strokeWidth=1.5).encode(x="x:Q")
+            rlab = ref.mark_text(align="left", dx=4, dy=-4, fontSize=11, color=INK, baseline="bottom").encode(
+                x="x:Q", y=alt.value(0), text="label:N")
+            return (bars + text + rule + rlab).properties(height=34 * len(d) + 30)
+        show_chart(build, title, f"{cname}, films credited to each company, all years; dashed line = all films")
         st.caption("*Credits come from each film's production companies, so a film can count for several (a Universal film "
                    "produced by Amblin and Imagine counts for both). Each company's films are the ones in this dataset, "
                    "not its full output. Hover a bar for its home studio and film count. Miramax, Blumhouse and "
@@ -890,15 +1075,17 @@ def studio_section():
             dist = pd.DataFrame({"Studio": STUDIOS, "Films": [int((dd["studio"] == x).sum()) for x in STUDIOS]})
             dist = dist[dist["Films"] > 0].sort_values("Films", ascending=False)
             top = dist.iloc[0]
-            chart = alt.Chart(dist).mark_bar(cornerRadiusEnd=3, strokeWidth=1.2, height={"band": 0.7}).encode(
-                y=alt.Y("Studio:N", sort=list(dist["Studio"]), title=None,
-                        axis=alt.Axis(labelColor=studio_expr("value"), labelFontWeight=600)),
-                x=alt.X("Films:Q", title="Films", axis=alt.Axis(tickMinStep=1)),
-                color=alt.Color("Studio:N", scale=alt.Scale(domain=list(dist["Studio"]),
-                                                            range=[STUDIO_COLOR[x] for x in dist["Studio"]]), legend=None),
-                stroke=alt.condition("datum.Studio == 'Paramount'", alt.value(KEYLINE), alt.value("white")),
-                tooltip=["Studio", "Films"])
-            show_chart(chart.properties(height=34 * len(dist) + 20),
+            def build():
+                return alt.Chart(dist).mark_bar(cornerRadiusEnd=3, strokeWidth=1.2, height={"band": 0.7}).encode(
+                    y=alt.Y("Studio:N", sort=list(dist["Studio"]), title=None,
+                            axis=alt.Axis(labelColor=studio_expr("value"), labelFontWeight=600)),
+                    x=alt.X("Films:Q", title="Films", axis=alt.Axis(tickMinStep=1)),
+                    color=alt.Color("Studio:N", scale=alt.Scale(domain=list(dist["Studio"]),
+                                                                range=[STUDIO_COLOR[x] for x in dist["Studio"]]),
+                                    legend=None),
+                    stroke=alt.condition("datum.Studio == 'Paramount'", alt.value(KEYLINE), alt.value("white")),
+                    tooltip=["Studio", "Films"]).properties(height=34 * len(dist) + 20)
+            show_chart(build,
                        f"{top['Studio']} released {int(top['Films'])} of its {len(dd)} films",
                        "Which major distributed the company's films")
         with right:
@@ -910,13 +1097,16 @@ def studio_section():
             long = mix.melt(id_vars="Genre", value_vars=["This company", "All films"], var_name="Series",
                             value_name="Share")
             long["Series"] = long["Series"].replace({"This company": one})
-            chart = alt.Chart(long).mark_bar(stroke="white", strokeWidth=1, cornerRadiusEnd=3).encode(
-                y=alt.Y("Genre:N", sort=GENRES, title=None), yOffset=alt.YOffset("Series:N", sort=[one, "All films"]),
-                x=alt.X("Share:Q", title="% of films"),
-                color=alt.Color("Series:N", scale=alt.Scale(domain=[one, "All films"], range=[BLUE, SOFT]),
-                                legend=alt.Legend(orient="top", title=None)),
-                tooltip=["Series", "Genre", alt.Tooltip("Share:Q", format=".0f", title="% of films")])
-            show_chart(chart.properties(height=40 * len(GENRES)),
+            def build():
+                return alt.Chart(long).mark_bar(stroke="white", strokeWidth=1, cornerRadiusEnd=3).encode(
+                    y=alt.Y("Genre:N", sort=GENRES, title=None),
+                    yOffset=alt.YOffset("Series:N", sort=[one, "All films"]),
+                    x=alt.X("Share:Q", title="% of films"),
+                    color=alt.Color("Series:N", scale=alt.Scale(domain=[one, "All films"], range=[BLUE, SOFT]),
+                                    legend=alt.Legend(orient="top", title=None)),
+                    tooltip=["Series", "Genre", alt.Tooltip("Share:Q", format=".0f", title="% of films")]
+                ).properties(height=40 * len(GENRES))
+            show_chart(build,
                        f"Over-indexes on {over['Genre'].lower()}: {over['This company']:.0f}% of its films vs. "
                        f"{over['All films']:.0f}% overall", "Genre mix vs. all films in the dataset")
         show_table(dd.sort_values("worldwide", ascending=False)[
@@ -930,43 +1120,29 @@ def studio_section():
                 "imdb": st.column_config.NumberColumn("IMDb", format="%.1f")})
 
     exhibit("Studio scorecard")
-    rows = []
-    for stu in STUDIOS:
-        d = FILMS[FILMS["studio"] == stu]
-        rows.append({"Studio": stu, "Films": len(d), "Median budget ($M)": median(d["budget_m"]),
-                     "Median worldwide ($M)": median(d["worldwide_m"]), "Median return (×)": median(d["multiple"]),
-                     f"Hit rate (≥{HIT_MULTIPLE}×)": d["hit"].mean() * 100, "Follow-ups (%)": d["follow_up"].mean() * 100,
-                     "Median week-2 drop (%)": median(d.loc[d["wide"] == 1, "drop2"]), "Median IMDb": median(d["imdb"])})
-    card = pd.DataFrame(rows).style.format({
+    card = studio_scorecard().style.format({
         "Median budget ($M)": "{:.0f}", "Median worldwide ($M)": "{:.0f}", "Median return (×)": "{:.2f}",
         f"Hit rate (≥{HIT_MULTIPLE}×)": "{:.0f}%", "Follow-ups (%)": "{:.0f}%", "Median week-2 drop (%)": "{:.0f}%",
         "Median IMDb": "{:.1f}"}).map(lambda v: f"color: {studio_text(v)}; font-weight: 600", subset=["Studio"])
     show_table(card)
-    st.caption("*These are the studio's films **in this dataset** (films whose scripts were available), not its full "
-               "slate, so read them as a sample.*")
+    st.caption(f"*These are the studio's films **in this dataset** (films whose scripts were available), not its full "
+               f"slate, so read them as a sample. Hit rate is a fixed bar ({HIT_MULTIPLE}× budget at the box office); "
+               f"the % profitable in [*Who's Winning*](#winning) uses your deal sliders instead, so the two "
+               f"percentages differ by design.*")
 
     exhibit("What each studio makes")
     metric = st.radio("Color the grid by", ["Share of the studio's films", "Median return on budget"], horizontal=True,
                       key="studio_genre_metric")
     is_share = metric.startswith("Share")
-    recs = []
-    for stu in STUDIOS:
-        d = FILMS[FILMS["studio"] == stu]
-        for g in GENRES:
-            dg = d[d["genre"] == g]
-            if is_share:
-                recs.append({"Studio": stu, "Genre": g, "Value": len(dg) / len(d) * 100, "n": len(dg)})
-            elif len(dg) >= 3:
-                recs.append({"Studio": stu, "Genre": g, "Value": median(dg["multiple"]), "n": len(dg)})
-    d = pd.DataFrame(recs)
+    d = studio_genre_grid(is_share)
     if is_share:
         u = d[d["Studio"] == "Universal"].sort_values("Value", ascending=False).iloc[0]
         title = f"Universal's biggest bet is {u['Genre'].lower()}: {u['Value']:.0f}% of its films"
     else:
         top = d.sort_values("Value", ascending=False).iloc[0]
         title = f"Best-paying cell: {top['Studio']} {top['Genre'].lower()}, {top['Value']:.1f}× budget (median)"
-    show_chart(heatmap(d, "Genre", "Studio", GENRES, STUDIOS, "% of films" if is_share else "Median return (×)",
-                       ".0f" if is_share else ".1f"), title,
+    show_chart(lambda: heatmap(d, "Genre", "Studio", GENRES, STUDIOS, "% of films" if is_share else "Median return (×)",
+                               ".0f" if is_share else ".1f"), title,
                "Share of each studio's films, by genre" if is_share else "Median worldwide ÷ budget, by studio and genre",
                panel=False)
     st.caption("*Read across a row: where does this studio place its bets?* " +
@@ -975,22 +1151,16 @@ def studio_section():
                 "few films in a high-return genre may be leaving money on the table.*"))
 
     exhibit("When each studio releases")
-    recs = []
-    for stu in STUDIOS:
-        d = FILMS[FILMS["studio"] == stu]
-        for i, m in enumerate(MONTHS, start=1):
-            n = int((d["month"] == i).sum())
-            recs.append({"Studio": stu, "Month": m, "Value": n / len(d) * 100, "n": n})
-    d = pd.DataFrame(recs)
+    d = studio_month_grid()
     u = d[d["Studio"] == "Universal"].sort_values("Value", ascending=False).iloc[0]
-    show_chart(heatmap(d, "Month", "Studio", MONTHS, STUDIOS, "% of films", ".0f"),
+    show_chart(lambda: heatmap(d, "Month", "Studio", MONTHS, STUDIOS, "% of films", ".0f"),
                f"Universal releases most often in {u['Month']} ({u['Value']:.0f}% of its films)",
                "Share of each studio's films released in each month (US)", panel=False)
     st.caption("*Summer (May–August) and the holidays (November–December) are the tentpole windows; January, February "
                "and September are traditionally the quiet months.*")
 
 
-# --- 3. Trends & Franchise Fatigue -------------------------------------------------------------------------------
+# --- 5. Trends & Calendar, and 3. Franchise Fatigue ----------------------------------------------------------------
 METRICS = {
     "Median worldwide box office ($M)": ("worldwide_m", "median", ".0f"),
     "Median opening weekend ($M)": ("opening_m", "median", ".0f"),
@@ -1001,15 +1171,17 @@ METRICS = {
     "Median IMDb rating": ("imdb", "median", ".1f"),
     "Number of films": ("id", "count", ".0f"),
 }
-GROUPS = {"Release period (5 years)": "period", "Season": "season", "Month": "month_name", "Genre": "genre",
-          "Rating": "mpaa", "Runtime": "runtime_band", "Original vs. follow-up": "kind"}
+# No Season/Month (the release calendar below covers timing) and no original-vs-follow-up slice (Franchise Fatigue
+# covers it), so each question has one home on the page. The "Films" filter can still restrict to either kind.
+GROUPS = {"Release period (5 years)": "period", "Genre": "genre", "Rating": "mpaa", "Runtime": "runtime_band"}
 
 
 @st.fragment
 def trends_section():
-    section("Trends", "Trends & Franchise Fatigue",
-            "**How it works:** pick a measure and a way to slice the films. Medians are used instead of averages so a "
-            "single billion-dollar outlier can't drag a whole group.")
+    section("Trends", "Trends & Calendar",
+            "**How it works:** pick a measure and a way to slice the films, then see which release months have paid "
+            "off for each genre. Medians are used instead of averages so a single billion-dollar outlier can't drag a "
+            "whole group.")
     c1, c2, c3, c4 = st.columns(4)
     mname = c1.selectbox("Measure", list(METRICS), help=measure_help(METRICS))
     gname = c2.selectbox("Slice by", list(GROUPS))
@@ -1017,7 +1189,6 @@ def trends_section():
     kind = c4.selectbox("Films", ["All films", "Originals only", "Follow-ups only"], key="trend_kind")
     col, how, f = METRICS[mname]
     d = FILMS.copy()
-    d["month_name"] = d["month"].map(lambda m: MONTHS[int(m) - 1] if pd.notna(m) else None)
     d["runtime_band"] = pd.cut(d["runtime"], [0, 90, 105, 120, 135, 999],
                                labels=["Under 90 min", "90–104", "105–119", "120–134", "135+"]).astype(str)
     if stu != "All studios":
@@ -1027,9 +1198,8 @@ def trends_section():
     if col == "drop2":
         d = d[d["wide"] == 1]
     g = GROUPS[gname]
-    order = {"season": SEASON_ORDER, "month_name": MONTHS, "genre": GENRES, "mpaa": ["G", "PG", "PG-13", "R", "Unrated/unknown"],
-             "runtime_band": ["Under 90 min", "90–104", "105–119", "120–134", "135+"],
-             "kind": ["Original", "Follow-up"]}.get(g, sorted(d[g].dropna().unique()))
+    order = {"genre": GENRES, "mpaa": ["G", "PG", "PG-13", "R", "Unrated/unknown"],
+             "runtime_band": ["Under 90 min", "90–104", "105–119", "120–134", "135+"]}.get(g, sorted(d[g].dropna().unique()))
     grp = d.groupby(g)
     out = grp[col].median() if how == "median" else (grp[col].mean() * 100 if how == "rate" else grp[col].count())
     agg = pd.DataFrame({"Group": out.index, "Value": out.values, "Films": grp[col].count().reindex(out.index).values})
@@ -1041,23 +1211,51 @@ def trends_section():
         measure = mname.replace("Median ", "").split(" (")[0].lower()
         title = f"{hi['Group']} leads on {measure} ({format(hi['Value'], f)}); {lo['Group']} trails ({format(lo['Value'], f)})"
         agg["Top"] = agg["Group"] == hi["Group"]
-        bars = alt.Chart(agg).mark_bar(stroke=KEYLINE if stu == "Paramount" else "white", strokeWidth=1,
-                                       cornerRadiusEnd=3, color=STUDIO_COLOR.get(stu, BLUE)).encode(
-            x=alt.X("Group:N", sort=order, title=None, axis=alt.Axis(labelAngle=0 if len(agg) <= 9 else -40)),
-            y=alt.Y("Value:Q", title=mname),
-            opacity=alt.condition("datum.Top", alt.value(1), alt.value(0.55)),
-            tooltip=[alt.Tooltip("Group:N", title=gname), alt.Tooltip("Value:Q", format=f, title=mname), "Films"])
-        labels = bars.mark_text(dy=-7, fontSize=11, color=INK).encode(text=alt.Text("Value:Q", format=f))
-        show_chart((bars + labels).properties(height=330), title,
+
+        def build():
+            bars = alt.Chart(agg).mark_bar(stroke=KEYLINE if stu == "Paramount" else "white", strokeWidth=1,
+                                           cornerRadiusEnd=3, color=STUDIO_COLOR.get(stu, BLUE)).encode(
+                x=alt.X("Group:N", sort=order, title=None, axis=alt.Axis(labelAngle=0 if len(agg) <= 9 else -40)),
+                y=alt.Y("Value:Q", title=mname),
+                opacity=alt.condition("datum.Top", alt.value(1), alt.value(0.55)),
+                tooltip=[alt.Tooltip("Group:N", title=gname), alt.Tooltip("Value:Q", format=f, title=mname), "Films"])
+            labels = bars.mark_text(dy=-7, fontSize=11, color=INK).encode(text=alt.Text("Value:Q", format=f))
+            return (bars + labels).properties(height=330)
+        show_chart(build, title,
                    f"{mname} by {gname.lower()} · {stu.lower() if stu == 'All studios' else stu} · {kind.lower()}")
         st.caption(f"*{len(d):,} films. Groups with fewer than 3 films are hidden; hover a bar for its film count. Dollar "
                    f"figures are nominal, so later periods look bigger partly because tickets cost more; return on "
                    f"budget and hit rate are ratios and compare cleanly across decades.*")
 
-    exhibit("Franchise fatigue: do follow-ups burn out faster?")
-    st.markdown("The case's Table 1 shows Marvel films losing two-thirds of their audience in week two, against an "
-                "industry average near 40% (and about 16% in the 1980s, 22% in the 1990s). Here is the same question "
-                "across every wide release in the data.")
+    exhibit("When to release: the calendar")
+    g = release_calendar()
+    rows_order = [x for x in GENRES if x in set(g["Genre"])]
+    if len(g):
+        top = g.loc[g[g["n"] >= 8]["Value"].idxmax()] if (g["n"] >= 8).any() else g.loc[g["Value"].idxmax()]
+        show_chart(lambda: heatmap(g, "Month", "Genre", MONTHS, rows_order, "Median return (×)", ".1f"),
+                   f"Best slot with 8+ films: {top['Genre'].lower()} in {top['Month']} "
+                   f"(median {top['Value']:.1f}× budget, {int(top['n'])} films)",
+                   "Median worldwide gross ÷ budget by genre and release month, wide releases", panel=False)
+    st.caption("*Blank cells have fewer than 4 films. Small cells are noisy: hover for the film count before you "
+               "build a release strategy on one square.*")
+
+
+@st.cache_data(show_spinner=False)
+def release_calendar():
+    """Median return by genre x release month, wide releases with budget and grosses (same films as Film Economics)."""
+    cal = FILMS.loc[FILMS["budget"].notna() & FILMS["worldwide"].notna() & FILMS["domestic"].notna()
+                    & (FILMS["wide"] == 1), ["genre", "month", "multiple"]].copy()
+    cal["Month"] = cal["month"].map(lambda x: MONTHS[int(x) - 1] if pd.notna(x) else None)
+    g = cal.groupby(["genre", "Month"])["multiple"].agg(["median", "size"]).reset_index()
+    return g[g["size"] >= 4].rename(columns={"genre": "Genre", "median": "Value", "size": "n"})
+
+
+def fatigue_section():
+    section("Trends", "Franchise Fatigue",
+            "The case's Table 1 shows Marvel films losing two-thirds of their audience in week two, against an "
+            "industry average near 40% (and about 16% in the 1980s, 22% in the 1990s). Here is the same question "
+            "across every wide release in the data.")
+    exhibit("Do follow-ups burn out faster?")
     w = FILMS[FILMS["wide"] == 1]
     dec = w.groupby(["decade", "kind"])["drop2"].agg(["median", "count"]).reset_index()
     dec = dec[dec["count"] >= 5]
@@ -1066,17 +1264,20 @@ def trends_section():
     title = (f"Follow-ups lose {both.loc[latest, 'Follow-up']:.0f}% of their audience in week two vs. "
              f"{both.loc[latest, 'Original']:.0f}% for originals ({latest}); in the {both.index.min()}: "
              f"{both.iloc[0]['Follow-up']:.0f}% vs. {both.iloc[0]['Original']:.0f}%")
-    kinds = ["Original", "Follow-up"]
-    bars = alt.Chart(dec).mark_bar(stroke="white", strokeWidth=0.8, cornerRadiusEnd=3).encode(
-        x=alt.X("decade:N", title=None, axis=alt.Axis(labelAngle=0)),
-        xOffset=alt.XOffset("kind:N", sort=kinds),
-        y=alt.Y("median:Q", title="Median % of week-1 gross lost in week 2"),
-        color=alt.Color("kind:N", sort=kinds, scale=alt.Scale(domain=kinds, range=[SOFT, BLUE]),
-                        legend=alt.Legend(orient="top", title=None)),
-        tooltip=[alt.Tooltip("decade:N", title="Decade"), alt.Tooltip("kind:N", title="Film"),
-                 alt.Tooltip("median:Q", format=".0f", title="Median drop (%)"), alt.Tooltip("count:Q", title="Films")])
-    labels = bars.mark_text(dy=-7, fontSize=11, color=INK).encode(text=alt.Text("median:Q", format=".0f"))
-    show_chart((bars + labels).properties(height=310), title, "Median week-1 to week-2 drop, wide releases, by decade")
+    def build():
+        kinds = ["Original", "Follow-up"]
+        bars = alt.Chart(dec).mark_bar(stroke="white", strokeWidth=0.8, cornerRadiusEnd=3).encode(
+            x=alt.X("decade:N", title=None, axis=alt.Axis(labelAngle=0)),
+            xOffset=alt.XOffset("kind:N", sort=kinds),
+            y=alt.Y("median:Q", title="Median % of week-1 gross lost in week 2"),
+            color=alt.Color("kind:N", sort=kinds, scale=alt.Scale(domain=kinds, range=[SOFT, BLUE]),
+                            legend=alt.Legend(orient="top", title=None)),
+            tooltip=[alt.Tooltip("decade:N", title="Decade"), alt.Tooltip("kind:N", title="Film"),
+                     alt.Tooltip("median:Q", format=".0f", title="Median drop (%)"),
+                     alt.Tooltip("count:Q", title="Films")])
+        labels = bars.mark_text(dy=-7, fontSize=11, color=INK).encode(text=alt.Text("median:Q", format=".0f"))
+        return (bars + labels).properties(height=310)
+    show_chart(build, title, "Median week-1 to week-2 drop, wide releases, by decade")
     st.caption("*Wide releases only (600+ opening theaters), decades with at least 5 films per group. The drop is week 1 "
                "to week 2 (7-day grosses), a little gentler than the case's weekend-to-weekend figures. Fans who waited "
                "for the sequel show up opening weekend, leaving fewer new viewers for week two.*")
@@ -1105,7 +1306,7 @@ def trends_section():
     st.caption("*Compare with the case's Table 1. A steep drop doesn't have to mean a flop: check the return column.*")
 
 
-# --- 4. Script DNA ---------------------------------------------------------------------------------------------------
+# --- 6. Script DNA -------------------------------------------------------------------------------------------------
 EMOTION_DEFS = {
     "Joy": "happiness, humor, warmth and relief", "Surprise": "shock, astonishment and reveals",
     "Fear": "threat, danger, dread and suspense", "Sadness": "loss, grief, vulnerability and regret",
@@ -1116,6 +1317,48 @@ EMOTION_DEFS = {
 
 def arc_long(d, emotion):
     return pd.DataFrame([{"Act": a, "Share": d[f"{emotion}_{a}"].mean() * 100} for a in range(1, 6)])
+
+
+NOVELTY_NAMES = ["1 · Most familiar", "2", "3", "4", "5 · Most novel"]
+
+
+@st.cache_data(show_spinner=False, max_entries=100)
+def hits_vs_misses(scope):
+    """Everything in Script DNA that depends only on the film selection (39 t-tests among it), computed once per
+    selection for the whole class. Returns hit/miss counts, {emotion: (hit arc, miss arc)}, the top-10 difference
+    table and {novelty column: quintile table or None}."""
+    d = FILMS if scope == "All films" else (FILMS[FILMS["studio"] == "Universal"] if scope == "Universal only"
+                                            else FILMS[FILMS["genre"] == scope.split(": ")[1]])
+    hits, misses = quartile_groups(d)
+    if len(hits) < 10:
+        return len(hits), len(misses), {}, None, {}
+    arcs = {e: (arc_long(hits, e), arc_long(misses, e)) for e in EMOTIONS}
+    rows = []
+    for e in EMOTIONS:
+        for act in range(1, 6):
+            c = f"{e}_{act}"
+            rows.append({"Emotion · act": f"{e} · {ACTS[act]}", "Hits": hits[c].mean() * 100,
+                         "Misses": misses[c].mean() * 100,
+                         "Difference": (hits[c].mean() - misses[c].mean()) * 100, "P-value": welch_p(hits[c], misses[c])})
+    for c, lab in [("emo_intensity", "Emotional intensity (index)"), ("emo_swing", "Emotional swing across acts (index)"),
+                   ("emo_novelty", "Emotional novelty vs. earlier films (index)"),
+                   ("narr_novelty", "Story novelty vs. earlier films (index)")]:
+        rows.append({"Emotion · act": lab, "Hits": hits[c].mean(), "Misses": misses[c].mean(),
+                     "Difference": hits[c].mean() - misses[c].mean(), "P-value": welch_p(hits[c], misses[c])})
+    diff = pd.DataFrame(rows).sort_values("P-value").head(10)
+    diff["Direction"] = np.where(diff["Difference"] > 0, "More in hits", "More in misses")
+    novelty = {}
+    for col in ("emo_novelty", "narr_novelty"):
+        q = d[[col, "multiple", "hit"]].dropna()
+        if len(q) < 25:
+            novelty[col] = None
+            continue
+        q = q.assign(Quintile=pd.qcut(q[col].rank(method="first"), 5, labels=NOVELTY_NAMES).astype(str))
+        agg = q.groupby("Quintile").agg(Return=("multiple", "median"), Hit=("hit", "mean"),
+                                        Films=("hit", "size")).reset_index()
+        agg["Hit"] *= 100
+        novelty[col] = agg
+    return len(hits), len(misses), arcs, diff, novelty
 
 
 @st.fragment
@@ -1145,13 +1388,16 @@ def script_section():
     title = (f"{peak['Series']} carries the most {emo.lower()}, peaking in Act {int(peak['Act'])} "
              f"({peak['Share']:.1f}% of dialogue)")
     dom = gs + ["All films"]
-    chart = alt.Chart(d).mark_line(point=line_points(), strokeWidth=2.25).encode(
-        x=act_axis(), y=alt.Y("Share:Q", title=f"% of dialogue read as {emo.lower()}"),
-        color=alt.Color("Series:N", scale=alt.Scale(domain=dom, range=[GENRE_COLOR[g] for g in gs] + [GRAY]),
-                        legend=alt.Legend(orient="top", title=None)),
-        strokeDash=alt.condition("datum.Series == 'All films'", alt.value([5, 4]), alt.value([1, 0])),
-        tooltip=["Series", "Act", alt.Tooltip("Share:Q", format=".1f", title="% of dialogue")])
-    show_chart(chart.properties(height=330), title, f"Average share of each act's dialogue read as {emo.lower()}")
+
+    def build():
+        return alt.Chart(d).mark_line(point=line_points(), strokeWidth=2.25).encode(
+            x=act_axis(), y=alt.Y("Share:Q", title=f"% of dialogue read as {emo.lower()}"),
+            color=alt.Color("Series:N", scale=alt.Scale(domain=dom, range=[GENRE_COLOR[g] for g in gs] + [GRAY]),
+                            legend=alt.Legend(orient="top", title=None)),
+            strokeDash=alt.condition("datum.Series == 'All films'", alt.value([5, 4]), alt.value([1, 0])),
+            tooltip=["Series", "Act", alt.Tooltip("Share:Q", format=".1f", title="% of dialogue")]
+        ).properties(height=330)
+    show_chart(build, title, f"Average share of each act's dialogue read as {emo.lower()}")
     st.caption(f"*{emo} = {EMOTION_DEFS[emo]}. Dashed gray = all films. Genres have signature shapes; a new film that "
                f"breaks its genre's shape is taking a creative risk.*")
 
@@ -1159,42 +1405,30 @@ def script_section():
     c1, c2, c3 = st.columns(3)
     scope = c1.selectbox("Films", ["All films", "Universal only"] + [f"Genre: {g}" for g in GENRE_ORDER], key="dna_scope")
     emo2 = c2.selectbox("Emotion to plot", EMOTIONS, index=0, key="dna_emo2")
-    d = FILMS if scope == "All films" else (FILMS[FILMS["studio"] == "Universal"] if scope == "Universal only"
-                                            else FILMS[FILMS["genre"] == scope.split(": ")[1]])
-    hits, misses = quartile_groups(d)
-    c3.metric("Films compared", f"{len(hits)} hits · {len(misses)} misses",
+    n_hits, n_misses, hm_arcs, diff, novelty = hits_vs_misses(scope)
+    c3.metric("Films compared", f"{n_hits} hits · {n_misses} misses",
               help="Hits = top 25% of return on budget within the films selected; misses = bottom 25%.")
-    if len(hits) < 10:
+    if n_hits < 10:
         st.info("Too few films with a return on budget in this selection. Choose a broader one.")
         return
-    a, b = arc_long(hits, emo2), arc_long(misses, emo2)
+    a, b = hm_arcs[emo2]
     gap = a["Share"] - b["Share"]
     k = int(gap.abs().idxmax())
     title = (f"Hits carry {'more' if gap[k] > 0 else 'less'} {emo2.lower()} than misses, most in Act {k + 1} "
              f"({gap[k]:+.1f} pts)")
     a["Group"], b["Group"] = "Hits (top 25% return)", "Misses (bottom 25% return)"
     groups = ["Hits (top 25% return)", "Misses (bottom 25% return)"]
-    chart = alt.Chart(pd.concat([a, b])).mark_line(point=line_points(), strokeWidth=2.25).encode(
-        x=act_axis(), y=alt.Y("Share:Q", title=f"% of dialogue read as {emo2.lower()}"),
-        color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[BLUE, INK]),
-                        legend=alt.Legend(orient="top", title=None)),
-        tooltip=["Group", "Act", alt.Tooltip("Share:Q", format=".1f", title="% of dialogue")])
-    show_chart(chart.properties(height=290), title, f"{scope}: {emo2.lower()} across the five acts, hits vs. misses")
+    arcs = pd.concat([a, b])
 
-    rows = []
-    for e in EMOTIONS:
-        for act in range(1, 6):
-            c = f"{e}_{act}"
-            rows.append({"Emotion · act": f"{e} · {ACTS[act]}", "Hits": hits[c].mean() * 100,
-                         "Misses": misses[c].mean() * 100,
-                         "Difference": (hits[c].mean() - misses[c].mean()) * 100, "P-value": welch_p(hits[c], misses[c])})
-    for c, lab in [("emo_intensity", "Emotional intensity (index)"), ("emo_swing", "Emotional swing across acts (index)"),
-                   ("emo_novelty", "Emotional novelty vs. earlier films (index)"),
-                   ("narr_novelty", "Story novelty vs. earlier films (index)")]:
-        rows.append({"Emotion · act": lab, "Hits": hits[c].mean(), "Misses": misses[c].mean(),
-                     "Difference": hits[c].mean() - misses[c].mean(), "P-value": welch_p(hits[c], misses[c])})
-    diff = pd.DataFrame(rows).sort_values("P-value").head(10)
-    diff["Direction"] = np.where(diff["Difference"] > 0, "More in hits", "More in misses")
+    def build():
+        return alt.Chart(arcs).mark_line(point=line_points(), strokeWidth=2.25).encode(
+            x=act_axis(), y=alt.Y("Share:Q", title=f"% of dialogue read as {emo2.lower()}"),
+            color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[BLUE, INK]),
+                            legend=alt.Legend(orient="top", title=None)),
+            tooltip=["Group", "Act", alt.Tooltip("Share:Q", format=".1f", title="% of dialogue")]
+        ).properties(height=290)
+    show_chart(build, title, f"{scope}: {emo2.lower()} across the five acts, hits vs. misses")
+
     st.markdown("**The ten biggest script differences between hits and misses**")
     show_table(diff[["Emotion · act", "Direction", "Hits", "Misses", "Difference", "P-value"]],
                column_config={"Hits": st.column_config.NumberColumn("Hits (% of dialogue)", format="%.2f"),
@@ -1211,23 +1445,21 @@ def script_section():
     nov = c1.radio("Novelty measure", ["Emotional novelty", "Story novelty"], key="dna_nov",
                    help="How far a film's emotional profile (or its story language) sits from earlier films in the data.")
     col = "emo_novelty" if nov == "Emotional novelty" else "narr_novelty"
-    q = d[[col, "multiple", "hit"]].dropna()
-    if len(q) >= 25:
-        names = ["1 · Most familiar", "2", "3", "4", "5 · Most novel"]
-        q = q.assign(Quintile=pd.qcut(q[col].rank(method="first"), 5, labels=names).astype(str))
-        agg = q.groupby("Quintile").agg(Return=("multiple", "median"), Hit=("hit", "mean"), Films=("hit", "size")).reset_index()
-        agg["Hit"] *= 100
+    agg = novelty[col]
+    if agg is not None:
+        names = NOVELTY_NAMES
         first, last = agg.set_index("Quintile").loc[names[0], "Return"], agg.set_index("Quintile").loc[names[-1], "Return"]
         title = f"The most novel fifth returns {last:.2f}× budget vs. {first:.2f}× for the most familiar"
-        bars = alt.Chart(agg).mark_bar(color=BLUE, cornerRadiusEnd=3).encode(
-            x=alt.X("Quintile:N", sort=names, title=None, axis=alt.Axis(labelAngle=0)),
-            y=alt.Y("Return:Q", title="Median return on budget (×)"),
-            tooltip=["Quintile", alt.Tooltip("Return:Q", format=".2f", title="Median return (×)"),
-                     alt.Tooltip("Hit:Q", format=".0f", title=f"Hit rate (%, ≥{HIT_MULTIPLE}×)"), "Films"])
+        def build():
+            bars = alt.Chart(agg).mark_bar(color=BLUE, cornerRadiusEnd=3).encode(
+                x=alt.X("Quintile:N", sort=names, title=None, axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("Return:Q", title="Median return on budget (×)"),
+                tooltip=["Quintile", alt.Tooltip("Return:Q", format=".2f", title="Median return (×)"),
+                         alt.Tooltip("Hit:Q", format=".0f", title=f"Hit rate (%, ≥{HIT_MULTIPLE}×)"), "Films"])
+            return (bars + bars.mark_text(dy=-7, fontSize=11, color=INK).encode(
+                text=alt.Text("Return:Q", format=".2f"))).properties(height=270)
         with c2:
-            show_chart((bars + bars.mark_text(dy=-7, fontSize=11, color=INK).encode(
-                text=alt.Text("Return:Q", format=".2f"))).properties(height=270), title,
-                f"{scope}: median return on budget by {nov.lower()} (five equal groups)")
+            show_chart(build, title, f"{scope}: median return on budget by {nov.lower()} (five equal groups)")
         st.caption("*A rising pattern means audiences rewarded freshness; a falling one means the familiar template paid. "
                    "Uses the films selected in 'Hits vs. misses' above.*")
 
@@ -1254,7 +1486,7 @@ def script_section():
                    "what a film feels like, not whether it worked; check its return.*")
 
 
-# --- 5. Wall Street Reaction --------------------------------------------------------------------------------------
+# --- 8. Wall Street & Parent Companies -----------------------------------------------------------------------------
 def ci_bars(d, order, colors, ytitle):
     base = alt.Chart(d).encode(x=alt.X("Group:N", sort=order, title=None, axis=alt.Axis(labelAngle=0)))
     bars = base.mark_bar(stroke="white", strokeWidth=0.8, cornerRadiusEnd=3, size=46).encode(
@@ -1308,8 +1540,9 @@ def wallstreet_section():
     r = pd.DataFrame(recs).set_index("Group")
     title = (f"Parent stocks moved {r.loc['Hits (top 25% return)', 'Mean']:+.2f}% after hits vs. "
              f"{r.loc['Misses (bottom 25% return)', 'Mean']:+.2f}% after misses")
-    show_chart(ci_bars(r.reset_index(), list(r.index), {"Misses (bottom 25% return)": INK, "Middle 50%": SOFT,
-                                                        "Hits (top 25% return)": BLUE}, "Average 5-day stock reaction (%)"),
+    show_chart(lambda: ci_bars(r.reset_index(), list(r.index), {"Misses (bottom 25% return)": INK, "Middle 50%": SOFT,
+                                                                "Hits (top 25% return)": BLUE},
+                               "Average 5-day stock reaction (%)"),
                title, f"{stu}: parent's abnormal stock return, release day to +5 trading days, with 95% intervals")
     st.caption("*Whiskers = 95% confidence interval; a whisker crossing zero means the reaction can't be told apart from "
                "none. Investors only see the opening weekend in this window, and one film is small next to a "
@@ -1323,8 +1556,8 @@ def wallstreet_section():
     r = pd.DataFrame(recs)
     best = r.loc[r["Mean"].idxmax()]
     u = r.set_index("Group").loc["Universal", "Mean"]
-    show_chart(ci_bars(r, STUDIOS, {s: STUDIO_COLOR[s] for s in STUDIOS},
-                       "Average 5-day stock reaction (%)"),
+    show_chart(lambda: ci_bars(r, STUDIOS, {s: STUDIO_COLOR[s] for s in STUDIOS},
+                               "Average 5-day stock reaction (%)"),
                f"{best['Group']} releases drew the warmest stock reaction ({best['Mean']:+.2f}%); Universal {u:+.2f}%",
                "Average 5-day abnormal return of the parent's stock after each release, all films")
     st.caption("*All of each studio's releases, whatever their box office. Read the whiskers before the bars.*")
@@ -1343,12 +1576,15 @@ def wallstreet_section():
         dh = t[(groups[0], qorder[2])] - t[(groups[0], qorder[0])]
         dm = t[(groups[1], qorder[2])] - t[(groups[1], qorder[0])]
         title = f"From the quarter before to the quarter after release, call tone moved {dh:+.3f} around hits vs. {dm:+.3f} around misses"
-        chart = alt.Chart(tone).mark_line(point=line_points(70), strokeWidth=2.25).encode(
-            x=alt.X("Quarter:N", sort=qorder, title=None, axis=alt.Axis(labelAngle=0)),
-            y=alt.Y("Tone:Q", title="Average earnings-call tone (positive − negative)", scale=alt.Scale(zero=False)),
-            color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[BLUE, INK]), legend=alt.Legend(orient="top", title=None)),
-            tooltip=["Group", "Quarter", alt.Tooltip("Tone:Q", format=".3f"), "Films"])
-        show_chart(chart.properties(height=290), title, f"{stu}: parent's earnings-call tone (FinBERT) around the release")
+        def build():
+            return alt.Chart(tone).mark_line(point=line_points(70), strokeWidth=2.25).encode(
+                x=alt.X("Quarter:N", sort=qorder, title=None, axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("Tone:Q", title="Average earnings-call tone (positive − negative)",
+                        scale=alt.Scale(zero=False)),
+                color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[BLUE, INK]),
+                                legend=alt.Legend(orient="top", title=None)),
+                tooltip=["Group", "Quarter", alt.Tooltip("Tone:Q", format=".3f"), "Films"]).properties(height=290)
+        show_chart(build, title, f"{stu}: parent's earnings-call tone (FinBERT) around the release")
         st.caption(f"*Films with call transcripts ({int(tone['Films'].max())} or fewer per point). Calls cover the whole "
                    f"company, so a film can only move the tone if it's big relative to the parent. Compare the slopes, "
                    f"not the levels.*")
@@ -1374,12 +1610,12 @@ def wallstreet_section():
     pad = (hi - lo) * 0.15
     pct = "" if metric == "Revenue" else "%"
     money_unit = "$" if metric == "Revenue" else ""
-    show_chart(studio_lines(pa, alt.X("Year:Q", title=None, axis=alt.Axis(format="d")),
-                            alt.Y("Value:Q", title=f"{metric} ({unit})",
-                                  scale=alt.Scale(domain=[float(max(lo - pad, 0) if metric == "Revenue" else lo - pad),
-                                                          float(hi + pad)], clamp=True)), pick,
-                            ["Studio", "Parent", alt.Tooltip("Year:Q", format="d", title="Fiscal year"),
-                             alt.Tooltip("Value:Q", format=".2f", title=f"{metric} ({unit})")])
+    ydom = [float(max(lo - pad, 0) if metric == "Revenue" else lo - pad), float(hi + pad)]
+    show_chart(lambda: studio_lines(pa, alt.X("Year:Q", title=None, axis=alt.Axis(format="d")),
+                                    alt.Y("Value:Q", title=f"{metric} ({unit})",
+                                          scale=alt.Scale(domain=ydom, clamp=True)), pick,
+                                    ["Studio", "Parent", alt.Tooltip("Year:Q", format="d", title="Fiscal year"),
+                                     alt.Tooltip("Value:Q", format=".2f", title=f"{metric} ({unit})")])
                .properties(height=330),
                f"Last five years: {lead}'s parent had the {best} ({money_unit}{recent[lead]:.1f}{pct}"
                f"{'B' if metric == 'Revenue' else ''})"
@@ -1410,14 +1646,15 @@ def wallstreet_section():
         tq = pq.set_index(["Group", "Quarter"])["Value"]
         dh = tq[(groups[0], qorder[2])] - tq[(groups[0], qorder[0])]
         dm = tq[(groups[1], qorder[2])] - tq[(groups[1], qorder[0])]
-        chart = alt.Chart(pq).mark_line(point=line_points(70), strokeWidth=2.25).encode(
-            x=alt.X("Quarter:N", sort=qorder, title=None, axis=alt.Axis(labelAngle=0)),
-            y=alt.Y("Value:Q", title=f"Average parent {metric if metric == 'ROA' else metric.lower()} ({unit})",
-                    scale=alt.Scale(zero=False)),
-            color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[BLUE, INK]),
-                            legend=alt.Legend(orient="top", title=None)),
-            tooltip=["Group", "Quarter", alt.Tooltip("Value:Q", format=".2f"), "Films"])
-        show_chart(chart.properties(height=290),
+        def build():
+            return alt.Chart(pq).mark_line(point=line_points(70), strokeWidth=2.25).encode(
+                x=alt.X("Quarter:N", sort=qorder, title=None, axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("Value:Q", title=f"Average parent {metric if metric == 'ROA' else metric.lower()} ({unit})",
+                        scale=alt.Scale(zero=False)),
+                color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[BLUE, INK]),
+                                legend=alt.Legend(orient="top", title=None)),
+                tooltip=["Group", "Quarter", alt.Tooltip("Value:Q", format=".2f"), "Films"]).properties(height=290)
+        show_chart(build,
                    f"From the quarter before to the quarter after, parent {metric if metric == 'ROA' else metric.lower()} "
                    f"moved {dh:+.2f} pts around hits vs. {dm:+.2f} pts around misses",
                    f"{stu}: parent's {metric if metric == 'ROA' else metric.lower()} in the quarters around each release")
@@ -1434,16 +1671,18 @@ def wallstreet_section():
         med = fs["Share"].median()
         topf = fs.loc[fs["Share"].idxmax()]
         by = fs.groupby("studio")["Share"].median().reindex(STUDIOS).dropna()
-        bars = alt.Chart(by.reset_index().rename(columns={"studio": "Studio", "Share": "Median"})).mark_bar(
-            cornerRadiusEnd=3, stroke="white", strokeWidth=0.8).encode(
-            x=alt.X("Studio:N", sort=list(by.index), title=None,
-                    axis=alt.Axis(labelAngle=0, labelColor=studio_expr("value"), labelFontWeight=600)),
-            y=alt.Y("Median:Q", title="Film's worldwide gross as % of parent's annual revenue"),
-            color=alt.Color("Studio:N", scale=alt.Scale(domain=list(by.index),
-                                                        range=[STUDIO_COLOR[x] for x in by.index]), legend=None),
-            stroke=alt.condition("datum.Studio == 'Paramount'", alt.value(KEYLINE), alt.value("white")),
-            tooltip=["Studio", alt.Tooltip("Median:Q", format=".2f", title="Median % of parent revenue")])
-        show_chart(bars.properties(height=260),
+        def build():
+            return alt.Chart(by.reset_index().rename(columns={"studio": "Studio", "Share": "Median"})).mark_bar(
+                cornerRadiusEnd=3, stroke="white", strokeWidth=0.8).encode(
+                x=alt.X("Studio:N", sort=list(by.index), title=None,
+                        axis=alt.Axis(labelAngle=0, labelColor=studio_expr("value"), labelFontWeight=600)),
+                y=alt.Y("Median:Q", title="Film's worldwide gross as % of parent's annual revenue"),
+                color=alt.Color("Studio:N", scale=alt.Scale(domain=list(by.index),
+                                                            range=[STUDIO_COLOR[x] for x in by.index]), legend=None),
+                stroke=alt.condition("datum.Studio == 'Paramount'", alt.value(KEYLINE), alt.value("white")),
+                tooltip=["Studio", alt.Tooltip("Median:Q", format=".2f", title="Median % of parent revenue")]
+            ).properties(height=260)
+        show_chart(build,
                    f"The typical film grosses {med:.2f}% of its parent's annual revenue; the biggest here, "
                    f"{topf['title']}, {topf['Share']:.1f}%",
                    f"{stu}: worldwide box office ÷ the parent's revenue in the release fiscal year, median by studio")
@@ -1470,7 +1709,7 @@ def wallstreet_section():
                "film. Use them as prompts for a story you can check, not as proof.*")
 
 
-# --- 6. Predict the Box Office ------------------------------------------------------------------------------------
+# --- 9. Predict the Box Office -------------------------------------------------------------------------------------
 OUTCOMES = ["Worldwide box office", "Opening weekend (US)", "Return on budget (worldwide ÷ budget)"]
 LAYERS = ["Metadata", "Metadata + Script emotions", "Metadata + Script emotions + Parent company"]
 LAYER_SHORT = {"Metadata": "1 · Metadata", "Metadata + Script emotions": "2 · + Script emotions",
@@ -1588,15 +1827,17 @@ def predict_section():
         rf = d[d["Model"] == "Random forest"].set_index("Data")["R²"]
         if LAYER_SHORT[LAYERS[0]] in rf and LAYER_SHORT[LAYERS[1]] in rf:
             title += f"; script emotions change that by {rf[LAYER_SHORT[LAYERS[1]]] - rf[LAYER_SHORT[LAYERS[0]]]:+.2f}"
-        bars = alt.Chart(d).mark_bar(stroke="white", strokeWidth=0.8, cornerRadiusEnd=3).encode(
-            x=alt.X("Data:N", sort=[LAYER_SHORT[l] for l in LAYERS], title=None, axis=alt.Axis(labelAngle=0)),
-            xOffset=alt.XOffset("Model:N", sort=MODEL_NAMES),
-            y=alt.Y("R²:Q", title="Cross-validated R²"),
-            color=alt.Color("Model:N", sort=MODEL_NAMES, scale=alt.Scale(domain=MODEL_NAMES, range=CAT[:3]),
-                            legend=alt.Legend(orient="top", title=None)),
-            tooltip=["Data", "Model", alt.Tooltip("R²:Q", format=".2f"), "Films"])
-        show_chart((bars + bars.mark_text(dy=-7, fontSize=10, color=INK).encode(text=alt.Text("R²:Q", format=".2f")))
-                   .properties(height=290), title,
+        def build():
+            bars = alt.Chart(d).mark_bar(stroke="white", strokeWidth=0.8, cornerRadiusEnd=3).encode(
+                x=alt.X("Data:N", sort=[LAYER_SHORT[l] for l in LAYERS], title=None, axis=alt.Axis(labelAngle=0)),
+                xOffset=alt.XOffset("Model:N", sort=MODEL_NAMES),
+                y=alt.Y("R²:Q", title="Cross-validated R²"),
+                color=alt.Color("Model:N", sort=MODEL_NAMES, scale=alt.Scale(domain=MODEL_NAMES, range=CAT[:3]),
+                                legend=alt.Legend(orient="top", title=None)),
+                tooltip=["Data", "Model", alt.Tooltip("R²:Q", format=".2f"), "Films"])
+            return (bars + bars.mark_text(dy=-7, fontSize=10, color=INK).encode(
+                text=alt.Text("R²:Q", format=".2f"))).properties(height=290)
+        show_chart(build, title,
                    f"{scope}, {out_l}: share of variation explained on unseen films (1 = perfect, 0 = no better than the average)")
         full = MODELS.get(f"{scope}|{outcome}|{LAYERS[2]}", {})
         same = full.get("same_films_without_parent") or {}
@@ -1642,22 +1883,28 @@ def predict_section():
     left, right = st.columns(2)
     with left:
         lo, hi = float(min(dd["Actual"].min(), dd["Predicted"].min())), float(max(dd["Actual"].max(), dd["Predicted"].max()))
-        pts = alt.Chart(dd).mark_circle(size=64, color=BLUE, opacity=0.8, stroke="white", strokeWidth=1).encode(
-            x=alt.X("Predicted:Q", scale=alt.Scale(type="log"), title="Predicted" + axis_t),
-            y=alt.Y("Actual:Q", scale=alt.Scale(type="log"), title="Actual" + axis_t),
-            tooltip=["Film", alt.Tooltip("Actual:Q", format=",.1f"), alt.Tooltip("Predicted:Q", format=",.1f")])
-        diag = alt.Chart(pd.DataFrame({"x": [lo, hi], "y": [lo, hi]})).mark_line(color="#9ca3af", strokeDash=[5, 4]).encode(x="x:Q", y="y:Q")
-        show_chart((diag + pts).properties(height=330),
+
+        def build():
+            pts = alt.Chart(dd).mark_circle(size=64, color=BLUE, opacity=0.8, stroke="white", strokeWidth=1).encode(
+                x=alt.X("Predicted:Q", scale=alt.Scale(type="log"), title="Predicted" + axis_t),
+                y=alt.Y("Actual:Q", scale=alt.Scale(type="log"), title="Actual" + axis_t),
+                tooltip=["Film", alt.Tooltip("Actual:Q", format=",.1f"), alt.Tooltip("Predicted:Q", format=",.1f")])
+            diag = alt.Chart(pd.DataFrame({"x": [lo, hi], "y": [lo, hi]})).mark_line(
+                color="#9ca3af", strokeDash=[5, 4]).encode(x="x:Q", y="y:Q")
+            return (diag + pts).properties(height=330)
+        show_chart(build,
                    f"{within2:.0f}% of unseen films land within 2× of the prediction",
                    f"Actual vs. predicted {out_l}, {mpick.lower()}, {entry['test']} test films")
         st.caption("*On the dashed line = predicted exactly; above it = the film beat its prediction. Hover for titles.*")
     with right:
-        res = alt.Chart(dd).mark_circle(size=64, color=BLUE, opacity=0.8, stroke="white", strokeWidth=1).encode(
-            x=alt.X("Predicted:Q", scale=alt.Scale(type="log"), title="Predicted" + axis_t),
-            y=alt.Y("Ratio:Q", scale=alt.Scale(type="log"), title="Actual ÷ predicted (log scale)"),
-            tooltip=["Film", alt.Tooltip("Ratio:Q", format=".2f", title="Actual ÷ predicted")])
-        one = alt.Chart(pd.DataFrame({"y": [1]})).mark_rule(color="#9ca3af", strokeDash=[5, 4]).encode(y="y:Q")
-        show_chart((one + res).properties(height=330), f"The typical miss is a factor of {miss:.1f} either way",
+        def build():
+            res = alt.Chart(dd).mark_circle(size=64, color=BLUE, opacity=0.8, stroke="white", strokeWidth=1).encode(
+                x=alt.X("Predicted:Q", scale=alt.Scale(type="log"), title="Predicted" + axis_t),
+                y=alt.Y("Ratio:Q", scale=alt.Scale(type="log"), title="Actual ÷ predicted (log scale)"),
+                tooltip=["Film", alt.Tooltip("Ratio:Q", format=".2f", title="Actual ÷ predicted")])
+            one = alt.Chart(pd.DataFrame({"y": [1]})).mark_rule(color="#9ca3af", strokeDash=[5, 4]).encode(y="y:Q")
+            return (one + res).properties(height=330)
+        show_chart(build, f"The typical miss is a factor of {miss:.1f} either way",
                    f"Residuals: actual ÷ predicted, {mpick.lower()}")
         st.caption("*1 = exact; 2 = the film earned twice its prediction; 0.5 = half. The spread is the uncertainty left "
                    "for creative judgment, marketing and luck.*")
@@ -1707,21 +1954,25 @@ def render_importance(rows, title, subtitle):
     d["Direction"] = np.where(d["Coef"] >= 0, "Positive association", "Negative association")
     d = d.sort_values("Importance", ascending=False)
     lim = float(d["Importance"].max()) * 1.3
-    base = alt.Chart(d).encode(y=alt.Y("Feature:N", sort=list(d["Feature"]), title=None))
-    bars = base.mark_bar(stroke="white", strokeWidth=0.8, cornerRadiusEnd=3, height={"band": 0.68}).encode(
-        x=alt.X("Signed:Q", scale=alt.Scale(domain=[-lim, lim]),
-                title="← Negative association   |   Random forest importance   |   Positive association →",
-                axis=alt.Axis(labelExpr="format(abs(datum.value), '.2f')")),
-        color=alt.Color("Direction:N", scale=alt.Scale(domain=["Positive association", "Negative association"],
-                                                       range=[BLUE, INK]), legend=alt.Legend(orient="top", title=None)),
-        tooltip=["Feature", alt.Tooltip("Importance:Q", format=".3f"),
-                 alt.Tooltip("Effect %:Q", format="+.1f", title="Effect on outcome (%)")])
-    zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#9ca3af").encode(x="x:Q")
-    pos = base.transform_filter("datum.Signed >= 0").mark_text(align="left", dx=4, fontSize=11, color=INK).encode(
-        x="Signed:Q", text=alt.Text("Importance:Q", format=".3f"))
-    neg = base.transform_filter("datum.Signed < 0").mark_text(align="right", dx=-4, fontSize=11, color=INK).encode(
-        x="Signed:Q", text=alt.Text("Importance:Q", format=".3f"))
-    show_chart((bars + zero + pos + neg).properties(height=max(170, 32 * len(d))), title, subtitle)
+
+    def build():
+        base = alt.Chart(d).encode(y=alt.Y("Feature:N", sort=list(d["Feature"]), title=None))
+        bars = base.mark_bar(stroke="white", strokeWidth=0.8, cornerRadiusEnd=3, height={"band": 0.68}).encode(
+            x=alt.X("Signed:Q", scale=alt.Scale(domain=[-lim, lim]),
+                    title="← Negative association   |   Random forest importance   |   Positive association →",
+                    axis=alt.Axis(labelExpr="format(abs(datum.value), '.2f')")),
+            color=alt.Color("Direction:N", scale=alt.Scale(domain=["Positive association", "Negative association"],
+                                                           range=[BLUE, INK]),
+                            legend=alt.Legend(orient="top", title=None)),
+            tooltip=["Feature", alt.Tooltip("Importance:Q", format=".3f"),
+                     alt.Tooltip("Effect %:Q", format="+.1f", title="Effect on outcome (%)")])
+        zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#9ca3af").encode(x="x:Q")
+        pos = base.transform_filter("datum.Signed >= 0").mark_text(align="left", dx=4, fontSize=11, color=INK).encode(
+            x="Signed:Q", text=alt.Text("Importance:Q", format=".3f"))
+        neg = base.transform_filter("datum.Signed < 0").mark_text(align="right", dx=-4, fontSize=11, color=INK).encode(
+            x="Signed:Q", text=alt.Text("Importance:Q", format=".3f"))
+        return (bars + zero + pos + neg).properties(height=max(170, 32 * len(d)))
+    show_chart(build, title, subtitle)
     st.caption("*Right (blue) = more of this goes with a bigger outcome; left (black) = smaller. Longer bar = stronger "
                "predictor. Direction comes from the regression coefficient, holding the other features constant.*")
 
@@ -1763,8 +2014,8 @@ def render_recommendations(rows, heldout_ok, out_l):
 
 
 
-# --- 4-5. Film Economics and Pitch a Film ----------------------------------------------------------------------------
-# One fragment for both sections, so the deal assumptions set in Film Economics also price the pitch.
+# --- 1. Film Economics, 2. Who's Winning, 7. Pitch a Film ---------------------------------------------------------
+# Sections 1 and 2 share one fragment and the deal sliders; Pitch a Film reads the same sliders from session state.
 ASSUME = {  # key: (label, min, max, default, step, help)
     "dom": ("Studio's share of US ticket sales", 35, 65, 50, 1,
             "Film rentals: the share of the domestic box office the theaters pass back to the distributor. Typically "
@@ -1782,6 +2033,8 @@ ASSUME = {  # key: (label, min, max, default, step, help)
                "office. Rough by nature: set 0 to look at theaters alone."),
 }
 TIERS = [(0, 50e6, "Under $50M"), (50e6, 150e6, "$50–150M"), (150e6, np.inf, "$150M+")]
+ECON_COLS = ["title", "label", "studio", "genre", "kind", "wide", "month", "budget", "domestic", "international",
+             "worldwide", "multiple"]
 
 
 def economics(d, a):
@@ -1838,14 +2091,19 @@ def waterfall(rows):
     return (bars + text + zero).properties(height=320)
 
 
-@st.fragment
-def economics_and_pitch():
+def deal_terms():
+    """The deal sliders' current values as fractions (defaults until a student moves them)."""
+    return {k: st.session_state.get(f"eco_{k}", dflt) / 100 for k, (_, _, _, dflt, _, _) in ASSUME.items()}
+
+
+@st.fragment   # class stops 1 and 2 share the deal sliders, so they rerun together
+def money_sections():
     section("Money", "Film Economics",
             "**How it works:** a film's box office isn't the studio's revenue. Theaters keep roughly half of ticket "
             "sales; the studio's share (*film rentals*) has to pay back the production budget **and** the marketing "
             "(*prints and advertising*, P&A). Then come the later *windows*: premium video-on-demand (PVOD), digital and "
             "disc, then streaming and pay TV. The data has budgets and grosses; you set the deal terms below, and every "
-            "number in this section and in *Pitch a Film* updates.")
+            "number here and in *Who's Winning* updates (*Pitch a Film* uses them too).")
     with st.container(border=True):
         st.markdown("**Your deal assumptions**")
         cols = st.columns(5)
@@ -1853,7 +2111,8 @@ def economics_and_pitch():
         for col, (k, (label, lo, hi, dflt, step, hlp)) in zip(cols, ASSUME.items()):
             a[k] = col.slider(label, lo, hi, dflt, step, format="%d%%", help=hlp, key=f"eco_{k}") / 100
 
-    d = FILMS[FILMS["budget"].notna() & FILMS["worldwide"].notna() & FILMS["domestic"].notna()].copy()
+    # Only the columns this section uses: copying the full ~150-column table on every slider move was its main cost.
+    d = FILMS.loc[FILMS["budget"].notna() & FILMS["worldwide"].notna() & FILMS["domestic"].notna(), ECON_COLS].copy()
     e = economics(d, a)
     d = d.join(e)
     dom_share = float((d["domestic"] / d["worldwide"]).median())
@@ -1881,13 +2140,19 @@ def economics_and_pitch():
             ("Home windows", r["Home windows"] / m, "up"), ("Streaming / pay TV", r["Streaming"] / m, "up"),
             ("Studio profit", r["Full-cycle profit"] / m, "total")]
     verdict = "made" if r["Full-cycle profit"] >= 0 else "lost"
-    show_chart(waterfall(rows),
+    show_chart(lambda: waterfall(rows),
                f"{r['title']} {verdict} an estimated {money(abs(r['Full-cycle profit']))} for the studio "
                f"({money(r['Theatrical profit'])} from theaters alone)",
                f"Estimated studio P&L, $M, under your assumptions ({r['multiple']:.2f}× budget at the box office)")
     st.caption("*Gray = what the box office took in; black = what's paid out or kept by others; blue = later windows; "
                "green = what's left for the studio. An estimate: real deals add distribution fees, talent "
                "participations (gross points), co-financier shares and overhead, which all shrink the studio's share.*")
+
+    section("Studios & money", "Who's Winning",
+            "**How it works:** three views of who is winning and where Universal should put capital: full-slate market "
+            "share year by year, which studios' films pay back under your deal terms, and how risk grows with budget. "
+            "The deal sliders are at the top of [*Film Economics*](#economics); move them and the last two charts update.")
+    studio_share_chart()
 
     exhibit("Who makes money: theaters alone vs. the full cycle")
     recs = []
@@ -1900,16 +2165,18 @@ def economics_and_pitch():
     w = pd.DataFrame(recs)
     gain = w.pivot(index="Studio", columns="Window", values="Share")
     gain = (gain["Full cycle"] - gain["Theaters only"]).sort_values(ascending=False)
-    wins = ["Theaters only", "Full cycle"]
-    bars = alt.Chart(w).mark_bar(cornerRadiusEnd=3, stroke="white", strokeWidth=0.8).encode(
-        x=alt.X("Studio:N", sort=STUDIOS, title=None, axis=alt.Axis(labelAngle=0, labelColor=studio_expr("value"),
-                                                                     labelFontWeight=600)),
-        xOffset=alt.XOffset("Window:N", sort=wins),
-        y=alt.Y("Share:Q", title="% of films profitable", scale=alt.Scale(domain=[0, 100])),
-        color=alt.Color("Window:N", sort=wins, scale=alt.Scale(domain=wins, range=[SOFT, BLUE]),
-                        legend=alt.Legend(orient="top", title=None)),
-        tooltip=["Studio", "Window", alt.Tooltip("Share:Q", format=".0f", title="% profitable"), "Films"])
-    show_chart(bars.properties(height=300),
+    def build():
+        wins = ["Theaters only", "Full cycle"]
+        return alt.Chart(w).mark_bar(cornerRadiusEnd=3, stroke="white", strokeWidth=0.8).encode(
+            x=alt.X("Studio:N", sort=STUDIOS, title=None, axis=alt.Axis(labelAngle=0, labelColor=studio_expr("value"),
+                                                                         labelFontWeight=600)),
+            xOffset=alt.XOffset("Window:N", sort=wins),
+            y=alt.Y("Share:Q", title="% of films profitable", scale=alt.Scale(domain=[0, 100])),
+            color=alt.Color("Window:N", sort=wins, scale=alt.Scale(domain=wins, range=[SOFT, BLUE]),
+                            legend=alt.Legend(orient="top", title=None)),
+            tooltip=["Studio", "Window", alt.Tooltip("Share:Q", format=".0f", title="% profitable"), "Films"]
+        ).properties(height=300)
+    show_chart(build,
                f"The later windows rescue the most films at {gain.index[0]} (+{gain.iloc[0]:.0f} pts); "
                f"Universal +{gain.get('Universal', np.nan):.0f} pts",
                "Share of each studio's films with a positive estimated profit, under your assumptions")
@@ -1928,26 +2195,31 @@ def economics_and_pitch():
                 recs.append({"Tier": t, "Kind": kind, "P10": g.quantile(0.1), "P50": g.median(),
                              "P90": g.quantile(0.9), "Win": (g > 0).mean() * 100, "Films": len(g)})
     rt = pd.DataFrame(recs)
-    kinds = ["Original", "Follow-up"]
-    base = alt.Chart(rt).encode(y=alt.Y("Tier:N", sort=tiers, title=None),
-                                yOffset=alt.YOffset("Kind:N", sort=kinds),
-                                color=alt.Color("Kind:N", sort=kinds, scale=alt.Scale(domain=kinds, range=[BLUE, CAT[1]]),
-                                                legend=alt.Legend(orient="top", title=None)))
-    tip = ["Tier", "Kind", alt.Tooltip("P10:Q", format=",.0f", title="Bad case (10th pct) $M"),
-           alt.Tooltip("P50:Q", format=",.0f", title="Typical (median) $M"),
-           alt.Tooltip("P90:Q", format=",.0f", title="Good case (90th pct) $M"),
-           alt.Tooltip("Win:Q", format=".0f", title="% profitable"), "Films"]
-    rng = base.mark_rule(strokeWidth=5, opacity=0.45).encode(x=alt.X("P10:Q", title="Estimated full-cycle profit ($M)"),
-                                                             x2="P90:Q", tooltip=tip)
-    mid = base.mark_point(filled=True, size=140, stroke="white", strokeWidth=1.5, opacity=1).encode(x="P50:Q", tooltip=tip)
-    zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#6b7280", strokeDash=[4, 3]).encode(x="x:Q")
+
+    def build():
+        kinds = ["Original", "Follow-up"]
+        base = alt.Chart(rt).encode(y=alt.Y("Tier:N", sort=tiers, title=None),
+                                    yOffset=alt.YOffset("Kind:N", sort=kinds),
+                                    color=alt.Color("Kind:N", sort=kinds,
+                                                    scale=alt.Scale(domain=kinds, range=[BLUE, CAT[1]]),
+                                                    legend=alt.Legend(orient="top", title=None)))
+        tip = ["Tier", "Kind", alt.Tooltip("P10:Q", format=",.0f", title="Bad case (10th pct) $M"),
+               alt.Tooltip("P50:Q", format=",.0f", title="Typical (median) $M"),
+               alt.Tooltip("P90:Q", format=",.0f", title="Good case (90th pct) $M"),
+               alt.Tooltip("Win:Q", format=".0f", title="% profitable"), "Films"]
+        rng = base.mark_rule(strokeWidth=5, opacity=0.45).encode(
+            x=alt.X("P10:Q", title="Estimated full-cycle profit ($M)"), x2="P90:Q", tooltip=tip)
+        mid = base.mark_point(filled=True, size=140, stroke="white", strokeWidth=1.5, opacity=1).encode(
+            x="P50:Q", tooltip=tip)
+        zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#6b7280", strokeDash=[4, 3]).encode(x="x:Q")
+        return (zero + rng + mid).properties(height=260)
     if len(rt):
         big = rt[rt["Tier"] == "$150M+"]
         small = rt[rt["Tier"] == "Under $50M"]
         tmed = d.groupby("Tier")["Full-cycle profit"].median()
         title = (f"$150M+ films risk the most and earn the most: median {money(tmed['$150M+'])} vs. "
                  f"{money(tmed['Under $50M'])} under $50M") if len(big) and len(small) else "Profit by budget tier"
-        show_chart((zero + rng + mid).properties(height=260), title,
+        show_chart(build, title,
                    "Estimated full-cycle profit per film: dot = median, bar = 10th to 90th percentile")
         show_table(rt.assign(Range=rt.apply(lambda x: f"{money(x['P10'] * 1e6)} to {money(x['P90'] * 1e6)}", axis=1))
                    [["Tier", "Kind", "Films", "Win", "P50", "Range"]],
@@ -1958,22 +2230,6 @@ def economics_and_pitch():
                "slate needs several of these films for the averages to show up. Tiers with fewer than 8 films are "
                "left out.*")
 
-    exhibit("When to release: the calendar")
-    cal = d[d["wide"] == 1].copy()
-    cal["Month"] = cal["month"].map(lambda x: MONTHS[int(x) - 1] if pd.notna(x) else None)
-    g = cal.groupby(["genre", "Month"])["multiple"].agg(["median", "size"]).reset_index()
-    g = g[g["size"] >= 4].rename(columns={"genre": "Genre", "median": "Value", "size": "n"})
-    rows_order = [x for x in GENRES if x in set(g["Genre"])]
-    if len(g):
-        top = g.loc[g[g["n"] >= 8]["Value"].idxmax()] if (g["n"] >= 8).any() else g.loc[g["Value"].idxmax()]
-        show_chart(heatmap(g, "Month", "Genre", MONTHS, rows_order, "Median return (×)", ".1f"),
-                   f"Best slot with 8+ films: {top['Genre'].lower()} in {top['Month']} "
-                   f"(median {top['Value']:.1f}× budget, {int(top['n'])} films)",
-                   "Median worldwide gross ÷ budget by genre and release month, wide releases", panel=False)
-    st.caption("*Blank cells have fewer than 4 films. Small cells are noisy: hover for the film count before you "
-               "build a release strategy on one square.*")
-
-    pitch_section(a)
 
 
 def pitch_predict(budget, genre, follow_up, rating, season, year):
@@ -1985,13 +2241,18 @@ def pitch_predict(budget, genre, follow_up, rating, season, year):
     return math.exp(z)
 
 
-def pitch_section(a):
+@st.fragment
+def pitch_section():
+    a = deal_terms()   # read fresh on every pitch click, so it follows the Film Economics sliders
     section("Decide", "Pitch a Film",
             "**How it works:** describe a film you'd greenlight. A regression fit on "
             f"{PITCH['films']} wide releases since {PITCH['since']} predicts its worldwide gross from the choices a "
             "studio makes before shooting (budget, genre, original or follow-up, rating, release season, year). Real "
             "films missed that prediction by a known spread, so you get a **range**, not a point, and the deal terms "
-            "from *Film Economics* turn the range into a **chance of making money**.")
+            "from [*Film Economics*](#economics) turn the range into a **chance of making money**.")
+    st.caption(f"Deal terms in use: {a['dom'] * 100:.0f}% of US tickets, {a['intl'] * 100:.0f}% international, P&A "
+               f"{a['pa'] * 100:.0f}% of budget, home windows {a['home'] * 100:.0f}% of US gross, streaming "
+               f"{a['stream'] * 100:.0f}% of worldwide. Moved the sliders since? Change any pitch input to refresh.")
     c1, c2, c3 = st.columns(3)
     genre = c1.selectbox("Genre", [g for g in GENRES], index=GENRES.index("Horror") if "Horror" in GENRES else 0,
                          key="pitch_genre")
@@ -2035,17 +2296,20 @@ def pitch_section(a):
                        {"Case": "Typical", "Gross": mid}, {"Case": "Strong (1 in 4)", "Gross": hi50},
                        {"Case": "Great case (1 in 10 do better)", "Gross": hi80}])
     sc["Profit"] = sc["Gross"].map(profit) / 1e6
-    order = list(sc["Case"])
-    base = alt.Chart(sc).encode(x=alt.X("Case:N", sort=order, title=None, axis=alt.Axis(labelAngle=0, labelLimit=150)))
-    bars = base.mark_bar(size=50, cornerRadiusEnd=3).encode(
-        y=alt.Y("Profit:Q", title="Estimated studio profit ($M)"),
-        color=alt.condition("datum.Profit >= 0", alt.value(BLUE), alt.value(INK)),
-        tooltip=["Case", alt.Tooltip("Gross:Q", format="$,.0f", title="Worldwide gross"),
-                 alt.Tooltip("Profit:Q", format="+,.0f", title="Profit ($M)")])
-    lab = base.mark_text(fontSize=11, color=INK, dy=-8).encode(y=alt.Y("Profit:Q"),
-                                                               text=alt.Text("Profit:Q", format="+,.0f"))
-    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#6b7280").encode(y="y:Q")
-    show_chart((bars + lab + zero).properties(height=300),
+    def build():
+        order = list(sc["Case"])
+        base = alt.Chart(sc).encode(x=alt.X("Case:N", sort=order, title=None,
+                                            axis=alt.Axis(labelAngle=0, labelLimit=150)))
+        bars = base.mark_bar(size=50, cornerRadiusEnd=3).encode(
+            y=alt.Y("Profit:Q", title="Estimated studio profit ($M)"),
+            color=alt.condition("datum.Profit >= 0", alt.value(BLUE), alt.value(INK)),
+            tooltip=["Case", alt.Tooltip("Gross:Q", format="$,.0f", title="Worldwide gross"),
+                     alt.Tooltip("Profit:Q", format="+,.0f", title="Profit ($M)")])
+        lab = base.mark_text(fontSize=11, color=INK, dy=-8).encode(y=alt.Y("Profit:Q"),
+                                                                   text=alt.Text("Profit:Q", format="+,.0f"))
+        zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#6b7280").encode(y="y:Q")
+        return (bars + lab + zero).properties(height=300)
+    show_chart(build,
                f"{p_win:.0f}% chance of profit: loses money in the weak case" if profit(lo50) < 0
                else f"{p_win:.0f}% chance of profit: still profitable in the weak case",
                "Estimated full-cycle studio profit across the range of outcomes, $M")
@@ -2108,10 +2372,16 @@ with st.sidebar:
                     unsafe_allow_html=True)
 
 # --- Page: one long scroll, in NAV order -----------------------------------------------------------------------------
+# Class stops first (teaching plan order), then the deeper lab.
+money_sections()      # 1 Film Economics, 2 Who's Winning
+fatigue_section()     # 3 Franchise Fatigue
+st.markdown("<div class='deeper'><b>Go deeper.</b> That's the end of the in-class stops. The sections below are the "
+            "full lab for your write-up: studio playbooks, trends and release timing, scripts, pitching your own "
+            "film, Wall Street's reaction, prediction models and the film database.</div>", unsafe_allow_html=True)
 studio_section()
 trends_section()
 script_section()
-economics_and_pitch()
+pitch_section()
 wallstreet_section()
 predict_section()
 database_section()
