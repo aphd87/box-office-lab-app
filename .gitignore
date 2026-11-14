@@ -3,3 +3,9 @@ __pycache__/
 .venv/
 data/
 .streamlit/secrets.toml
+
+# Never commit keys or tokens
+*Token*.txt
+*token*.txt
+*API Key*
+.env
