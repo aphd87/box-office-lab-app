@@ -2004,24 +2004,73 @@ def predict_section():
                      "below) and when it releases within the year (see <a href='#trends'>Trends &amp; Calendar</a>).")
 
         # What the machine-learning model relies on: XGBoost importance on metadata + script emotions (all its films)
-        imp = MODELS.get(f"{scope}|HIT|{LAYERS[1]}" if hit else f"{scope}|{outcome}|{LAYERS[1]}", {}).get("xgb_importance")
+        imp_entry = MODELS.get(f"{scope}|HIT|{LAYERS[1]}" if hit else f"{scope}|{outcome}|{LAYERS[1]}", {})
+        imp = imp_entry.get("xgb_importance")
         di = None
         if imp:
             exhibit("What does XGBoost look at?")
+            # XGBoost's own score on unseen films (metadata + script emotions), so every definition can use real numbers
+            xgb_scores = (imp_entry.get("accuracy" if hit else "cv") or {}).get("XGBoost")
+            xgb_score = max(float(np.mean(xgb_scores)), 0) * 100 if xgb_scores else None
+            score_name = "% of films called right (hit or miss)" if hit else f"% of the differences in {out_l} explained"
+            score_short = "of films called right" if hit else "of the differences explained"
+            ex_score = xgb_score if xgb_score and xgb_score > 15 else (60 if hit else 40)
+            st.markdown(
+                "**How to read this chart.** Imagine testing a forecaster by taking away one piece of information at a "
+                "time and seeing how much worse the forecasts get. The more the forecasts suffer, the more the "
+                "forecaster was leaning on that information.\n"
+                "- **XGBoost**: a prediction method that builds hundreds of small *decision trees* (simple yes/no "
+                "rules like *\"budget over $80M? → predict higher\"*) one after another, each new tree fixing the "
+                "mistakes of the ones before. Think of a team of analysts where each one reviews the last one's "
+                "misses.\n"
+                "- **Feature**: one piece of information the model knows about every film: budget, genre, release "
+                "month, rating, how much fear is in act 3, and so on. Each bar is one feature.\n"
+                f"- **Score**: how good XGBoost's forecasts are on films it never saw while learning. "
+                + (f"Here it's the **{score_name}**: the share of films it correctly calls as a hit (earned at least "
+                   f"{HIT_MULTIPLE:g}× its budget) or a miss." if hit else
+                   f"Here it's the **{score_name}** (statisticians call this *R²*): 100% would mean the model "
+                   f"predicts every film exactly, 0% means it does no better than guessing that every film earns the "
+                   f"average.")
+                + (f" XGBoost scores **{xgb_score:.0f}%** with these films.\n" if xgb_score is not None else "\n")
+                + "- **Scrambled**: we shuffle one feature across the films (for example, every film gets some other "
+                "film's budget) so that feature becomes meaningless, while everything else stays true.\n"
+                f"- **Points lost** (bar length, and the number when you hover): how far the score falls when that "
+                f"feature is scrambled. *Example: if the score drops from {ex_score:.0f}% to {ex_score - 10:.0f}%, "
+                f"that feature's bar shows 10 points lost.* A long bar = the model leans on it heavily; a short bar = "
+                f"it barely matters; features worth 0 points are left off.\n"
+                "- **Colors**: <span style='color:" + BLUE + "'>■</span> **Business lever**: something the studio "
+                "decides (budget, release date, rating, genre, number of theaters). "
+                "<span style='color:" + CAT[1] + "'>■</span> **Creative lever**: something in the script (the "
+                "emotions in each act). <span style='color:" + SOFT + "'>■</span> **Context**: facts a studio can't "
+                "change for this film (release year, which studio, the parent company's finances).\n"
+                "- **What it does *not* tell you**: whether *more* of a feature is good or bad (a long budget bar "
+                "doesn't say bigger budgets win), or that the feature *causes* success. For direction, see "
+                "*What drives…* further down.", unsafe_allow_html=True)
             plain = {"Budget (log)": "Budget", "Opening theaters (log)": "Opening theaters", "Runtime (minutes)": "Runtime"}
+
+            def meaning(name, pts):
+                if xgb_score is None:
+                    return f"Scrambling {name.lower()} costs the model {pts:.1f} points of its score."
+                return (f"XGBoost scores {xgb_score:.0f}% {score_short}; with {name.lower()} scrambled it falls to "
+                        f"about {max(xgb_score - pts, 0):.0f}%, a loss of {pts:.1f} points.")
+
             allf = pd.DataFrame([{"Feature": plain.get(k, k), "Share": v,
-                                  "Type": describe_feature(k)[3].replace(" (not a lever)", "")} for k, v in imp.items()])
+                                  "Type": describe_feature(k)[3].replace(" (not a lever)", ""),
+                                  "What it is": describe_feature(k)[0],
+                                  "What the bar means": meaning(plain.get(k, k), v)} for k, v in imp.items()])
             di = allf[allf["Share"] > 0].sort_values("Share", ascending=False).head(10)
             types = ["Business lever", "Creative lever", "Context"]
 
             def build():
                 return alt.Chart(di).mark_bar(cornerRadiusEnd=3, stroke="white", strokeWidth=0.8).encode(
                     y=alt.Y("Feature:N", sort=list(di["Feature"]), title=None, axis=alt.Axis(labelLimit=260)),
-                    x=alt.X("Share:Q", title=("Points of accuracy lost when this feature is scrambled" if hit else
-                                              "Points of R² lost when this feature is scrambled")),
+                    x=alt.X("Share:Q", title=("Points lost from the score when this feature is scrambled "
+                                              "(longer bar = model relies on it more)")),
                     color=alt.Color("Type:N", sort=types, scale=alt.Scale(domain=types, range=[BLUE, CAT[1], SOFT]),
                                     legend=alt.Legend(orient="top", title=None)),
-                    tooltip=["Feature", "Type", alt.Tooltip("Share:Q", format=".2f", title="Points lost")]
+                    tooltip=["Feature", "What it is", "Type",
+                             alt.Tooltip("Share:Q", format=".1f", title="Points lost when scrambled"),
+                             "What the bar means"]
                 ).properties(height=26 * len(di) + 20)
             if di.empty:
                 st.caption("*With this few films, scrambling any single feature doesn't change XGBoost's predictions "
@@ -2032,17 +2081,18 @@ def predict_section():
             lead = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
             is_script = allf["Feature"].str.contains(" · Act ") | allf["Feature"].str.startswith(("Emotional ", "Story "))
             script = allf[is_script].sort_values("Share", ascending=False)
-            unit = "accuracy" if hit else "R²"
             tail = (f"; the strongest script feature ({script.iloc[0]['Feature'].lower()}) is worth "
-                    f"{script.iloc[0]['Share']:.1f} pts of {unit}" if len(script) and script.iloc[0]["Share"] > 0 else "")
+                    f"{script.iloc[0]['Share']:.1f} points of the score" if len(script) and script.iloc[0]["Share"] > 0
+                    else "")
             show_chart(build, f"XGBoost relies most on {lead}{tail}",
                        f"The features that matter most for {'hit or miss' if hit else out_l}, metadata + script "
                        f"emotions, {scope}")
-            st.caption("*How it's measured: on films the model never saw, scramble one feature at a time and see how "
-                       "much worse the predictions get (averaged over the 5 cross-validation runs). A feature that "
-                       "only fit noise in the training films scores zero. It shows what the model **relies on**, not "
-                       "which direction helps or whether it causes success: for direction, see the regression results "
-                       "below.*")
+            st.caption("*How it's measured: the model learns from 80% of the films and is tested on the other 20%, five "
+                       "times over with a different 20% each time (this is called cross-validation). In each test, one "
+                       "feature at a time is scrambled and the drop in the score is recorded; the bar is the average "
+                       "drop across the five tests. A feature that only helped by coincidence in the films the model "
+                       "learned from doesn't help on new films, so it scores zero. Hover any bar for its definition and "
+                       "what its number means.*")
 
     else:
         st.info(f"Too few films in '{scope}' for stable models. Choose more films.")
@@ -2633,6 +2683,31 @@ GLOSSARY = {
     "Leverage": "Debt ÷ total assets.",
     "R²": "Share of the variation a model explains: 1 = perfect, 0 = no better than guessing the average.",
     "Cross-validation": "Scoring a model on films it didn't learn from, several times over, for an honest grade.",
+    "Accuracy": "For hit-or-miss forecasts: the % of films the model calls correctly, on films it never saw.",
+    "Just guess (baseline)": "Always predicting the more common answer (e.g. \"miss\" for every film). A model has "
+                             "to beat this to be useful.",
+    "Points (pts)": "Percentage points: the gap between two percentages. 60% → 50% is a loss of 10 points.",
+    "Feature": "One piece of information a model gets about each film: budget, genre, release month, rating, the "
+               "emotions in each act of the script, etc.",
+    "Metadata": "What a studio knows at the greenlight meeting: budget, theaters, runtime, year, rating, season, "
+                "follow-up or original, star power, genre, studio.",
+    "Script emotions": "How much of each act's dialogue reads as joy, fear, anger, sadness, etc., scored line by line "
+                       "from the screenplay by an AI emotion model.",
+    "Linear regression": "Draws the best straight-line relationship between each feature and the outcome, holding the "
+                         "others fixed. Easy to read: each feature gets one number for its effect.",
+    "Logistic regression": "The hit-or-miss version of linear regression: estimates each film's chance of being a hit.",
+    "Decision tree": "A flowchart of yes/no questions (\"budget over $80M?\", \"rated PG-13?\") that sorts films into "
+                     "groups and predicts each group's typical result.",
+    "Random forest": "Hundreds of decision trees, each built on a slightly different sample of films, whose forecasts "
+                     "are averaged. Steadier than one tree.",
+    "XGBoost": "Hundreds of small decision trees built one after another, each fixing the mistakes of the ones before "
+               "(\"gradient boosting\"). Often the most accurate, but hardest to read.",
+    "Points lost when scrambled": "How much a model's score drops when one feature is shuffled among the films so it "
+                                  "carries no real information. Bigger = the model relies on it more. Says nothing "
+                                  "about whether more of the feature is good or bad.",
+    "Business lever": "A feature the studio decides: budget, release date, rating, genre, number of theaters.",
+    "Creative lever": "A feature that comes from the script, such as the emotions in each act.",
+    "Context": "A feature the studio can't change for this film: release year, which studio, the parent's finances.",
     "p-value": "How surprising a result would be if there were no real relationship. Below 0.10 = flagged here.",
     "95% interval": "The range that would contain the true average 95% of the time. Crossing zero = can't rule out none.",
 }
