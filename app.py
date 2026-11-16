@@ -111,6 +111,7 @@ NAV = {"Film Economics": "economics", "Who's Winning": "winning", "Franchise Fat
        "Movie Database": "database"}
 NAV_NUM = {t: str(i) for i, t in enumerate(NAV, start=1)}
 CLASS_STOPS = 3
+BUILD_STOPS = 6   # sections after this one are the hands-on tools: pitch, Wall Street, predict, database
 
 
 # --- Definitions on hover ---------------------------------------------------------------------------------------
@@ -646,8 +647,10 @@ c2.markdown("**The Solution**  \n"
             "dialogue, measured with NLP across five acts) and the **parent company** (how Wall Street and the "
             "quarter's financials responded). Use it to build the evidence behind your Bottom Line Up Front.")
 _pills = [f"<a href='#{a}'><b>{NAV_NUM[t]}</b>{t}</a>" for t, a in NAV.items()]
-st.markdown("<div class='navbar'><span class='navsep' style='margin-left:0'>In class</span>"
-            + "".join(_pills[:CLASS_STOPS]) + "<span class='navsep'>Go deeper</span>" + "".join(_pills[CLASS_STOPS:])
+st.markdown("<div class='navbar'><span class='navsep' style='margin-left:0'>Where's the money?</span>"
+            + "".join(_pills[:CLASS_STOPS]) + "<span class='navsep'>What to make?</span>"
+            + "".join(_pills[CLASS_STOPS:BUILD_STOPS]) + "<span class='navsep'>Build your pitch</span>"
+            + "".join(_pills[BUILD_STOPS:])
             + "</div>", unsafe_allow_html=True)
 st.caption("Hover any number, column header or ⓘ for its definition. Section menu and full glossary: the › arrow at "
            "the top left.")
@@ -720,16 +723,21 @@ def database_section():
 TMDB_IMG = "https://image.tmdb.org/t/p/w342"   # the student's browser loads posters from TMDB; nothing is stored here
 
 
+def show_poster(poster, title):
+    """The film's TMDB poster plus the attribution TMDB's terms require. Used by the film profile and Film Economics."""
+    st.markdown(f"<img src='{TMDB_IMG}{poster}' alt='Poster for {html.escape(title, quote=True)}' "
+                f"style='width:100%;max-width:200px;border-radius:6px;border:1px solid #e5e7eb'>",
+                unsafe_allow_html=True)
+    st.caption("Poster: [TMDB](https://www.themoviedb.org). This product uses the TMDB API but is not "
+               "endorsed or certified by TMDB.")
+
+
 def render_profile(r):
     poster = r.get("poster")
     head = st.columns([1, 5]) if isinstance(poster, str) else [None, st.container()]
     if head[0] is not None:
         with head[0]:
-            st.markdown(f"<img src='{TMDB_IMG}{poster}' alt='Poster for {html.escape(r['title'], quote=True)}' "
-                        f"style='width:100%;max-width:200px;border-radius:6px;border:1px solid #e5e7eb'>",
-                        unsafe_allow_html=True)
-            st.caption("Poster: [TMDB](https://www.themoviedb.org). This product uses the TMDB API but is not "
-                       "endorsed or certified by TMDB.")
+            show_poster(poster, r["title"])
     with head[1]:
         st.markdown(f"### {r['title']} ({r['year']})")
         bits = [r["studio"], r["genre"], f"Rated {r['mpaa']}" if r["mpaa"] != "Unrated/unknown" else "Unrated/unknown",
@@ -2204,10 +2212,17 @@ def money_sections():
             ("Home windows", r["Home windows"] / m, "up"), ("Streaming / pay TV", r["Streaming"] / m, "up"),
             ("Studio profit", r["Full-cycle profit"] / m, "total")]
     verdict = "made" if r["Full-cycle profit"] >= 0 else "lost"
-    show_chart(lambda: waterfall(rows),
-               f"{r['title']} {verdict} an estimated {money(abs(r['Full-cycle profit']))} for the studio "
-               f"({money(r['Theatrical profit'])} from theaters alone)",
-               f"Estimated studio P&L, $M, under your assumptions ({r['multiple']:.2f}× budget at the box office)")
+    # The poster isn't in ECON_COLS (kept lean on purpose), so look it up for just the picked film.
+    poster = FILMS.loc[FILMS["label"] == pick, "poster"].iloc[0] if "poster" in FILMS else None
+    side = st.columns([1, 5]) if isinstance(poster, str) else [None, st.container()]
+    if side[0] is not None:
+        with side[0]:
+            show_poster(poster, r["title"])
+    with side[1]:
+        show_chart(lambda: waterfall(rows),
+                   f"{r['title']} {verdict} an estimated {money(abs(r['Full-cycle profit']))} for the studio "
+                   f"({money(r['Theatrical profit'])} from theaters alone)",
+                   f"Estimated studio P&L, $M, under your assumptions ({r['multiple']:.2f}× budget at the box office)")
     st.caption("*Gray = what the box office took in; black = what's paid out or kept by others; blue = later windows; "
                "the last bar = what's left for the studio (blue if it made money, black if it lost money). An "
                "estimate: real deals add distribution fees, talent "
@@ -2447,6 +2462,9 @@ st.markdown("<div class='deeper'><b>Go deeper.</b> That's the end of the in-clas
 studio_section()
 trends_section()
 script_section()
+st.markdown("<div class='deeper'><b>Build your pitch.</b> You've seen the evidence. Now use it: pitch your own film, see how "
+            "Wall Street reacts, test a box-office prediction and look up any film in the database.</div>",
+            unsafe_allow_html=True)
 pitch_section()
 wallstreet_section()
 predict_section()
