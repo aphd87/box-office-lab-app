@@ -1785,7 +1785,7 @@ OUTCOMES = ["Worldwide box office", "Opening weekend (US)", "Return on budget (w
 LAYERS = ["Metadata", "Metadata + Script emotions", "Metadata + Script emotions + Parent company"]
 LAYER_SHORT = {"Metadata": "1 · Metadata", "Metadata + Script emotions": "2 · + Script emotions",
                "Metadata + Script emotions + Parent company": "3 · + Parent company"}
-MODEL_NAMES = ["Linear regression", "Decision tree", "Random forest"]
+MODEL_NAMES = ["Linear regression", "Decision tree", "Random forest", "XGBoost"]
 SCOPES = ["All studios", "Universal only"] + [f"Genre: {g}" for g in GENRE_ORDER]
 
 BUSINESS = {  # feature: (definition, if positive, if negative, lever type)
@@ -1866,77 +1866,170 @@ def describe_feature(f):
 @st.fragment
 def predict_section():
     section("Models", "Predict the Box Office",
-            "**How it works:** choose which films, which outcome and how much data the models may use. Three models "
-            "learn from a random 80% of the films and are scored on the 20% they never saw: a **linear regression** "
-            "(readable coefficients), a **decision tree** (splits the films into smaller and smaller groups) and a "
-            "**random forest** (hundreds of trees averaged, which handles more complexity). The question isn't only "
+            "**How it works:** choose which films and which outcome. Four models "
+            "learn from 80% of the films and are scored on the 20% they never saw: a **linear regression** "
+            "(readable coefficients), a **decision tree** (splits the films into smaller and smaller groups), a "
+            "**random forest** (hundreds of trees averaged) and **XGBoost** (gradient boosting: trees built one after "
+            "another, each fixing the last one's mistakes). The question isn't only "
             "*which model wins*, but **how predictable a film's success is at all**, and what each extra layer of data "
             "adds.")
     c1, c2 = st.columns(2)
     scope = c1.selectbox("Films", SCOPES, key="pred_scope")
     outcome = c2.selectbox("Outcome to predict", OUTCOMES, key="pred_outcome")
+    out_l = outcome.split(" (")[0].lower()
+
+    exhibit("Does more data help? Four models, three layers of data")
+    hit_view = f"Hit or miss: will it earn {HIT_MULTIPLE:g}× its budget?"
+    view = st.radio("Question", [hit_view, "How much: predict the outcome chosen above"], horizontal=True,
+                    key="pred_view", label_visibility="collapsed")
+    hit = view == hit_view
+    grid_rows = []
+    for li in LAYERS:
+        e = MODELS.get(f"{scope}|HIT|{li}" if hit else f"{scope}|{outcome}|{li}", {})
+        scores = e.get("accuracy" if hit else "cv")
+        if scores:
+            grid_rows.append((li, e, {m: float(np.mean(scores[m])) for m in MODEL_NAMES}))
+    if grid_rows:
+        guess = "Just guess"   # hit view: the bar to beat, always guessing the more common answer
+        cols_x = ([guess] if hit else []) + MODEL_NAMES
+        recs = [{"Data": f"{LAYER_SHORT[li]} ({e['films']:,} films)", "Model": m, "Raw": v * 100,
+                 "Value": max(v, 0) * 100} for li, e, sc in grid_rows for m, v in sc.items()]
+        if hit:
+            recs += [{"Data": f"{LAYER_SHORT[li]} ({e['films']:,} films)", "Model": guess, "Raw": e["baseline"] * 100,
+                      "Value": e["baseline"] * 100} for li, e, _ in grid_rows]
+        g = pd.DataFrame(recs)
+        rows = list(dict.fromkeys(g["Data"]))
+        legend = "% of films called right" if hit else "% of variation explained"
+
+        def build():
+            base = alt.Chart(g).encode(
+                x=alt.X("Model:N", sort=cols_x, title=None,
+                        axis=alt.Axis(labelAngle=0, orient="top", labelFontWeight=600, labelFontSize=13)),
+                y=alt.Y("Data:N", sort=rows, title=None, axis=alt.Axis(labelFontWeight=600, labelFontSize=13,
+                                                                     labelLimit=300)))
+            models = alt.datum.Model != guess
+            rect = base.mark_rect(stroke="white", strokeWidth=2, cornerRadius=2).encode(
+                color=alt.condition(models, alt.Color("Value:Q", title=legend, legend=None,
+                                                      scale=alt.Scale(range=["#eef4fe", BLUE])), alt.value("#f3f4f6")),
+                tooltip=["Data", "Model", alt.Tooltip("Raw:Q", format=".1f", title=legend)])
+            cut = g.loc[g["Model"] != guess, "Value"].quantile(0.6)
+            text = base.transform_calculate(label="format(datum.Value, '.0f') + '%'").mark_text(
+                fontSize=15, fontWeight=600).encode(
+                text="label:N", color=alt.condition(f"datum.Model != '{guess}' && datum.Value > {cut}",
+                                                    alt.value("white"), alt.value(INK)))
+            return (rect + text).properties(height=64 * len(rows) + 30)
+
+        head_rows = [r for r in grid_rows if LAYERS.index(r[0]) < 2] or grid_rows
+        lift = (lambda r, m: r[2][m] - r[1]["baseline"]) if hit else (lambda r, m: r[2][m])
+        li_b, e_b, sc_b = max(head_rows, key=lambda r: max(lift(r, m) for m in r[2]))
+        m_b = max(sc_b, key=lambda m: lift((li_b, e_b, sc_b), m))
+        data_b = {0: "metadata alone", 1: "metadata + script emotions",
+                  2: "metadata + script + parent company"}[LAYERS.index(li_b)]
+        if hit:
+            word = "miss" if e_b["hit_rate"] < 0.5 else "hit"
+            pts = (sc_b[m_b] - e_b["baseline"]) * 100
+            title = (f"Best: {m_b} with {data_b} calls {sc_b[m_b] * 100:.0f}% of films right, {pts:+.0f} pts over "
+                     f"always guessing \"{word}\" ({e_b['baseline'] * 100:.0f}%)")
+            sub = (f"{scope}: share of films the models classify correctly as hit (≥{HIT_MULTIPLE:g}× budget) or miss, "
+                   f"on films they never saw. {e_b['hit_rate'] * 100:.0f}% of these films were hits.")
+        else:
+            title = (f"Best: {m_b} with {data_b} explains {max(sc_b[m_b], 0) * 100:.0f}% of the variation in "
+                     f"{out_l} on films it never saw")
+            sub = f"{scope}, {out_l}: share of variation explained on unseen films (0% = no better than the average)"
+        show_chart(build, title, sub, panel=False)
+
+        # Plain-language answer: what each added layer of data does to the best model's score
+        def best(sc):
+            return max(sc.values()) * 100
+        by_layer = {LAYERS.index(li): (e, sc) for li, e, sc in grid_rows}
+        msg = []
+        if 0 in by_layer and 1 in by_layer:
+            gain = best(by_layer[1][1]) - best(by_layer[0][1])
+            msg.append(f"Adding <b>script emotions</b> ({gain:+.0f} pts) " +
+                       ("barely moves the best score: the script adds little that budget, stars, genre and timing "
+                        "didn't already capture." if abs(gain) < 2.5 else "raises the best score: the script carries "
+                        "real signal beyond the business facts." if gain > 0 else "lowers the best score: the extra "
+                        "features add more noise than signal."))
+        if 2 in by_layer and (by_layer[2][0].get("same_films_without_parent") or {}).get("accuracy" if hit else "cv"):
+            e2, sc2 = by_layer[2]
+            same = e2["same_films_without_parent"]["accuracy" if hit else "cv"]
+            gain = best(sc2) - max(float(np.mean(v)) for v in same.values()) * 100
+            msg.append(f"Adding the <b>parent company</b> ({gain:+.0f} pts, measured on the same {e2['films']:,} films, "
+                       f"the only ones with parent financials) " +
+                       ("barely moves it either." if abs(gain) < 2.5 else "helps." if gain > 0 else "hurts."))
+        miss_room = 100 - max(best(sc) for _, _, sc in head_rows)
+        if hit:
+            lift_pts = max(lift(r, m) for r in head_rows for m in r[2]) * 100
+            msg.append(f"<b>The business point:</b> everything a studio knows before release beats a blind guess by "
+                       f"only <b>{lift_pts:.0f} pts</b>, and the best model still misjudges {miss_room:.0f}% of films. "
+                       f"Hits are hard to call, which is why studios spread risk across a slate and why Langley's "
+                       f"greenlight is still a bet.")
+        else:
+            msg.append(f"<b>The business point:</b> {miss_room:.0f}% of the variation in {out_l} is left unexplained: "
+                       f"the room for creative judgment, marketing and luck. Langley's greenlight is still a bet.")
+        takeaway("<b>What this tells us:</b> " + " ".join(msg))
+        st.caption("*Read **across** a row to compare models, **down** a column to see what more data adds. Each box is "
+                   "the average of 5-fold cross-validation: the models learn from 80% of the films and are scored on the "
+                   "20% they never saw, five times over. Row 3 has fewer films because parent financials exist only for "
+                   "some. **Linear regression** (logistic regression in the hit-or-miss view) is the one you can read "
+                   "line by line below; **decision tree**, **random forest** and **XGBoost** (gradient "
+                   "boosting: hundreds of small trees, each fixing the last one's mistakes) are machine-learning "
+                   "models that can pick up interactions the regression can't.*")
+
+        # What the machine-learning model relies on: XGBoost importance on metadata + script emotions (all its films)
+        imp = MODELS.get(f"{scope}|HIT|{LAYERS[1]}" if hit else f"{scope}|{outcome}|{LAYERS[1]}", {}).get("xgb_importance")
+        di = None
+        if imp:
+            exhibit("What does XGBoost look at?")
+            plain = {"Budget (log)": "Budget", "Opening theaters (log)": "Opening theaters", "Runtime (minutes)": "Runtime"}
+            allf = pd.DataFrame([{"Feature": plain.get(k, k), "Share": v,
+                                  "Type": describe_feature(k)[3].replace(" (not a lever)", "")} for k, v in imp.items()])
+            di = allf[allf["Share"] > 0].sort_values("Share", ascending=False).head(10)
+            types = ["Business lever", "Creative lever", "Context"]
+
+            def build():
+                return alt.Chart(di).mark_bar(cornerRadiusEnd=3, stroke="white", strokeWidth=0.8).encode(
+                    y=alt.Y("Feature:N", sort=list(di["Feature"]), title=None, axis=alt.Axis(labelLimit=260)),
+                    x=alt.X("Share:Q", title=("Points of accuracy lost when this feature is scrambled" if hit else
+                                              "Points of R² lost when this feature is scrambled")),
+                    color=alt.Color("Type:N", sort=types, scale=alt.Scale(domain=types, range=[BLUE, CAT[1], SOFT]),
+                                    legend=alt.Legend(orient="top", title=None)),
+                    tooltip=["Feature", "Type", alt.Tooltip("Share:Q", format=".2f", title="Points lost")]
+                ).properties(height=26 * len(di) + 20)
+            if di.empty:
+                st.caption("*With this few films, scrambling any single feature doesn't change XGBoost's predictions "
+                           "on unseen films: there's no reliable signal to rank. Choose more films.*")
+                di = None
+        if di is not None:
+            names = [n.lower() for n in di["Feature"].head(3)]
+            lead = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+            is_script = allf["Feature"].str.contains(" · Act ") | allf["Feature"].str.startswith(("Emotional ", "Story "))
+            script = allf[is_script].sort_values("Share", ascending=False)
+            unit = "accuracy" if hit else "R²"
+            tail = (f"; the strongest script feature ({script.iloc[0]['Feature'].lower()}) is worth "
+                    f"{script.iloc[0]['Share']:.1f} pts of {unit}" if len(script) and script.iloc[0]["Share"] > 0 else "")
+            show_chart(build, f"XGBoost relies most on {lead}{tail}",
+                       f"The features that matter most for {'hit or miss' if hit else out_l}, metadata + script "
+                       f"emotions, {scope}")
+            st.caption("*How it's measured: on films the model never saw, scramble one feature at a time and see how "
+                       "much worse the predictions get (averaged over the 5 cross-validation runs). A feature that "
+                       "only fit noise in the training films scores zero. It shows what the model **relies on**, not "
+                       "which direction helps or whether it causes success: for direction, see the regression results "
+                       "below.*")
+    else:
+        st.info(f"Too few films in '{scope}' for stable models. Choose more films.")
+
+    exhibit("Look closer: one model run")
     layer = st.radio("Data the models can use", LAYERS, horizontal=True, key="pred_layer",
                      help="Metadata = known before release: budget, opening theaters, runtime, year, rating, season, "
                           "follow-up or original, star power, genre, studio. Script emotions = the 7 emotions × 5 acts "
                           "plus intensity, swing and novelty. Parent company = the parent's ROA, margin, leverage, "
                           "earnings-call tone and stock momentum in the quarter before release.")
-    out_l = outcome.split(" (")[0].lower()
-
-    exhibit("Does more data help?")
-    recs = []
-    for li in LAYERS:
-        e = MODELS.get(f"{scope}|{outcome}|{li}", {})
-        for mname in MODEL_NAMES:
-            if "cv" in e:
-                recs.append({"Data": LAYER_SHORT[li], "Model": mname, "R²": float(np.mean(e["cv"][mname])),
-                             "Films": e["films"]})
-    if recs:
-        d = pd.DataFrame(recs)
-        best = d.loc[d["R²"].idxmax()]
-        title = f"Best: {best['Model'].lower()} with {best['Data'][4:].lstrip('+ ').lower()} explains " \
-                f"{max(best['R²'], 0) * 100:.0f}% of the variation in {out_l}"
-        rf = d[d["Model"] == "Random forest"].set_index("Data")["R²"]
-        if LAYER_SHORT[LAYERS[0]] in rf and LAYER_SHORT[LAYERS[1]] in rf:
-            title += f"; script emotions change that by {rf[LAYER_SHORT[LAYERS[1]]] - rf[LAYER_SHORT[LAYERS[0]]]:+.2f}"
-        def build():
-            bars = alt.Chart(d).mark_bar(stroke="white", strokeWidth=0.8, cornerRadiusEnd=3).encode(
-                x=alt.X("Data:N", sort=[LAYER_SHORT[l] for l in LAYERS], title=None, axis=alt.Axis(labelAngle=0)),
-                xOffset=alt.XOffset("Model:N", sort=MODEL_NAMES),
-                y=alt.Y("R²:Q", title="Cross-validated R²"),
-                color=alt.Color("Model:N", sort=MODEL_NAMES, scale=alt.Scale(domain=MODEL_NAMES, range=RAMP3),
-                                legend=alt.Legend(orient="top", title=None)),
-                tooltip=["Data", "Model", alt.Tooltip("R²:Q", format=".2f"), "Films"])
-            return (bars + bars.mark_text(dy=-7, fontSize=10).encode(
-                text=alt.Text("R²:Q", format=".2f"), color=alt.value(INK))).properties(height=290)
-        show_chart(build, title,
-                   f"{scope}, {out_l}: share of variation explained on unseen films (1 = perfect, 0 = no better than the average)")
-        full = MODELS.get(f"{scope}|{outcome}|{LAYERS[2]}", {})
-        same = full.get("same_films_without_parent") or {}
-        note = ""
-        if same.get("cv") and "cv" in full:
-            rf_with, rf_without = np.mean(full["cv"]["Random forest"]), np.mean(same["cv"]["Random forest"])
-            note = (f" **Careful with layer 3:** parent financials exist for only {full['films']} of these films, so it's "
-                    f"a different sample. On those same films *without* parent data the random forest scores "
-                    f"{rf_without:.2f}, vs. {rf_with:.2f} with it: the parent layer's real contribution is "
-                    f"{rf_with - rf_without:+.2f}.")
-        st.caption("*Each bar is the average R² over 5-fold cross-validation (five different 80/20 splits), steadier than "
-                   "any single split. If a layer doesn't raise the bars, that data isn't helping the models predict, even "
-                   "when it describes the films well.*" + note)
     entry = MODELS.get(f"{scope}|{outcome}|{layer}", {})
     if "results" not in entry:
         st.warning(f"Only {entry.get('films', 0)} films in '{scope}' have this outcome and these data (minimum 50), "
                    f"too few for stable models. Choose more films or fewer data layers.")
         return
-
-    exhibit(f"Model benchmark: {layer}")
-    cols = st.columns(3)
-    for col, m in zip(cols, MODEL_NAMES):
-        col.metric(f"{m} · R² (test)", fmt(entry["benchmarks"][m]),
-                   help=f"Cross-validated R²: {np.mean(entry['cv'][m]):.2f} (5 folds: "
-                        f"{', '.join(f'{v:.2f}' for v in entry['cv'][m])}).")
-    st.caption(f"*Scored on the {entry['test']} test films the models never saw ({entry['train']} training films). The "
-               f"linear regression uses the {entry['parameters'] - 1} screened features shown below; the tree and the "
-               f"forest may use every feature in the data layer. Hover a tile for its cross-validated R².*")
     if entry["train"] / entry["parameters"] < 10:
         st.warning(f"Small sample: {entry['train']} training films for {entry['parameters']} regression parameters. "
                    f"Expect unstable coefficients; trust the cross-validated R² over the single test split.")
