@@ -1786,7 +1786,9 @@ LAYERS = ["Metadata", "Metadata + Script emotions", "Metadata + Script emotions 
 LAYER_SHORT = {"Metadata": "1 · Metadata", "Metadata + Script emotions": "2 · + Script emotions",
                "Metadata + Script emotions + Parent company": "3 · + Parent company"}
 MODEL_NAMES = ["Linear regression", "Decision tree", "Random forest", "XGBoost"]
-SCOPES = ["All studios", "Universal only"] + [f"Genre: {g}" for g in GENRE_ORDER]
+PERIODS = ["Before 1990", "1990–94", "1995–99", "2000–04", "2005–09", "2010–14", "2015 on"]   # as in build_data.py
+SCOPES = (["All studios", "Universal only"] + [f"Genre: {g}" for g in GENRE_ORDER]
+          + [f"Years: {p}" for p in PERIODS])
 
 BUSINESS = {  # feature: (definition, if positive, if negative, lever type)
     "Budget (log)": ("Production budget (log scale, so equal steps are equal % increases).",
@@ -1976,6 +1978,31 @@ def predict_section():
                    "boosting: hundreds of small trees, each fixing the last one's mistakes) are machine-learning "
                    "models that can pick up interactions the regression can't.*")
 
+        # How predictable were films in each period? Best model's score per period (metadata + script emotions)
+        best_by_period = {}
+        for per in PERIODS:
+            e = MODELS.get(f"Years: {per}|HIT|{LAYERS[1]}" if hit else f"Years: {per}|{outcome}|{LAYERS[1]}", {})
+            sc = e.get("accuracy" if hit else "cv")
+            if sc:
+                best_by_period[per] = (max(np.mean(v) for v in sc.values()) - (e["baseline"] if hit else 0)) * 100
+        if best_by_period:
+            bp = list(best_by_period.items())
+            seq = ", ".join(f"{k} {v:+.0f}" if hit else f"{k} {max(v, 0):.0f}%" for k, v in bp)
+            if hit:
+                head = (f"<b>Over time, calling hit vs. miss has stayed hard.</b> In each release period the best model "
+                        f"beats a blind guess by at most {max(v for _, v in bp):.0f} pts, and in some periods not at "
+                        f"all (pts over guessing: {seq}).")
+            else:
+                f0, f1 = max(bp[0][1], 0), max(bp[-1][1], 0)
+                trend = ("has become much more predictable" if f1 > f0 + 10 else
+                         "has become less predictable" if f1 < f0 - 10 else "is about as predictable as it was")
+                head = (f"<b>Over time, {out_l} {trend}.</b> The best model explains {f0:.0f}% of the variation for "
+                        f"films released {bp[0][0].lower()} vs. {f1:.0f}% for films from {bp[-1][0]} ({seq}): "
+                        f"in the era of wide releases and franchises, results have become easier to forecast.")
+            takeaway(head + " <b>Can a studio change this?</b> Not the era: release year is context, not a lever. "
+                     "What it can act on is which drivers matter in its era (compare periods under <i>What drives…</i> "
+                     "below) and when it releases within the year (see <a href='#trends'>Trends &amp; Calendar</a>).")
+
         # What the machine-learning model relies on: XGBoost importance on metadata + script emotions (all its films)
         imp = MODELS.get(f"{scope}|HIT|{LAYERS[1]}" if hit else f"{scope}|{outcome}|{LAYERS[1]}", {}).get("xgb_importance")
         di = None
@@ -2016,10 +2043,27 @@ def predict_section():
                        "only fit noise in the training films scores zero. It shows what the model **relies on**, not "
                        "which direction helps or whether it causes success: for direction, see the regression results "
                        "below.*")
+
     else:
         st.info(f"Too few films in '{scope}' for stable models. Choose more films.")
 
     exhibit("Look closer: one model run")
+    st.markdown(
+        "**How to use this.** The grid above compared models. Here you inspect one of them the way an analyst would, "
+        "on the films and outcome chosen at the top of this section.\n"
+        "1. **Pick the data.** Start with *Metadata*: what a studio knows at the greenlight meeting.\n"
+        "2. **Pick a model** for the two plots. Dots near the dashed line were predicted well. Hover over the dots far "
+        "above or below it: which films beat or missed their forecast, and why (word of mouth, a breakout star, a "
+        "crowded weekend)?\n"
+        "3. **Read *What drives…*** to see which features move the outcome and in which direction, then switch the "
+        "comparison below it to *By genre* or *Over time* to see whether those drivers hold everywhere. *Regression "
+        "results* give how much and how sure.\n\n"
+        "**Questions for your write-up:**\n"
+        "- How big is the typical miss? Would you greenlight a $200M film on a forecast that can be off by that much?\n"
+        "- Which top drivers can Langley actually control (budget, release date, rating, casting, follow-up vs. "
+        "original) and which are just context?\n"
+        "- Switch to *Metadata + Script emotions*. Does anything in the script show up as a driver, and does the "
+        "typical miss get smaller?")
     layer = st.radio("Data the models can use", LAYERS, horizontal=True, key="pred_layer",
                      help="Metadata = known before release: budget, opening theaters, runtime, year, rating, season, "
                           "follow-up or original, star power, genre, studio. Script emotions = the 7 emotions × 5 acts "
@@ -2089,6 +2133,7 @@ def predict_section():
             show_table(pd.DataFrame(entry["vif_dropped"]).round({"VIF at removal": 1}))
         else:
             st.markdown("No feature needed to be dropped.")
+    drivers_by_group(outcome, layer, out_l)
 
     exhibit("Regression results")
     table = pd.DataFrame({
@@ -2139,6 +2184,64 @@ def render_importance(rows, title, subtitle):
     show_chart(build, title, subtitle)
     st.caption("*Right (blue) = more of this goes with a bigger outcome; left (black) = smaller. Longer bar = stronger "
                "predictor. Direction comes from the regression coefficient, holding the other features constant.*")
+
+
+def drivers_by_group(outcome, layer, out_l):
+    """The regression's significant drivers side by side, one model per genre or per release period: does what
+    drives the outcome change with the kind of film, or over time?"""
+    exhibit(f"Same question, by genre or over time")
+    by = st.radio("Compare", ["By genre", "Over time (release period)"], horizontal=True, key="pred_compare",
+                  label_visibility="collapsed")
+    groups = ([(g, f"Genre: {g}") for g in GENRE_ORDER] if by == "By genre"
+              else [(p, f"Years: {p}") for p in PERIODS])
+    recs = []
+    for label, scope_key in groups:
+        e = MODELS.get(f"{scope_key}|{outcome}|{layer}", {})
+        for r in e.get("results", []):
+            if r["P-value"] < 0.10:
+                recs.append({"Group": f"{label} ({e['films']})", "Feature": r["Feature"].replace(" (log)", ""),
+                             "Effect": r["Effect %"], "P": r["P-value"], "Scaled": r["Scaled"]})
+    cols = [f"{label} ({MODELS[f'{k}|{outcome}|{layer}']['films']})" for label, k in groups
+            if "results" in MODELS.get(f"{k}|{outcome}|{layer}", {})]
+    if not recs or len(cols) < 2:
+        st.info("Too few films per group with these data for stable models. Choose fewer data layers above.")
+        return
+    d = pd.DataFrame(recs)
+    counts = d["Feature"].value_counts()
+    feats = list(counts.index[:12])                   # features significant in the most groups first
+    d = d[d["Feature"].isin(feats)]
+    cap = float(np.nanpercentile(np.abs(d["Effect"]), 90)) or 1.0
+    d["Color"] = d["Effect"].clip(-cap, cap)
+
+    def build():
+        base = alt.Chart(d).encode(
+            x=alt.X("Group:N", sort=cols, scale=alt.Scale(domain=cols), title=None,
+                    axis=alt.Axis(labelAngle=0, orient="top", labelFontWeight=600, labelLimit=110)),
+            y=alt.Y("Feature:N", sort=feats, title=None, axis=alt.Axis(labelLimit=260)))
+        rect = base.mark_rect(stroke="white", strokeWidth=2, cornerRadius=2).encode(
+            color=alt.Color("Color:Q", scale=alt.Scale(domain=[-cap, 0, cap], range=["#4b5563", "#f8fafc", BLUE]),
+                            legend=None),
+            tooltip=[alt.Tooltip("Group:N", title="Films"), "Feature",
+                     alt.Tooltip("Effect:Q", format="+.0f", title="Effect on outcome (%)"),
+                     alt.Tooltip("P:Q", format=".3f", title="P-value")])
+        text = base.mark_text(fontSize=11).encode(
+            text=alt.Text("Effect:Q", format="+.0f"),
+            color=alt.condition(f"abs(datum.Color) > {cap * 0.55}", alt.value("white"), alt.value(INK)))
+        return (rect + text).properties(height=30 * len(feats) + 30)
+    common = counts.index[0]
+    signs = d[d["Feature"] == common]["Effect"]
+    flips = [f for f in feats if (d.loc[d["Feature"] == f, "Effect"] > 0).nunique() > 1]
+    title = (f"{common} matters in {counts.iloc[0]} of {len(cols)} {'genres' if by == 'By genre' else 'periods'}"
+             + (", always in the same direction" if signs.gt(0).nunique() == 1 else "")
+             + (f"; {', '.join(f.lower() for f in flips[:2])} flip{'s' if len(flips[:2]) == 1 else ''} direction "
+                f"between groups" if flips else ""))
+    show_chart(build, title,
+               f"Significant drivers of {out_l} (p < 0.10), {layer.lower()}: % change in {out_l} per step, one "
+               f"regression per {'genre' if by == 'By genre' else 'release period'} (films in brackets)", panel=False)
+    st.caption("*Blue = more of this goes with a bigger outcome; gray = smaller; blank = not a significant driver "
+               "there (or not among that model's screened features). A step is +1 standard deviation for numbers, "
+               "yes vs. no for yes/no features. Groups are small, so look for patterns that repeat across several "
+               "columns rather than any single cell.*")
 
 
 def render_recommendations(rows, heldout_ok, out_l):
