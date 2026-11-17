@@ -2475,6 +2475,45 @@ def money_sections():
                "estimate: real deals add distribution fees, talent "
                "participations (gross points), co-financier shares and overhead, which all shrink the studio's share.*")
 
+    exhibit("From box office to profit: a genre or studio slate")
+    genre_grp = d["genre"].where(d["genre"].isin(GENRE_ORDER), "Other")
+    cols = st.columns(2)
+    stu_pick = cols[0].selectbox("Studio", ["All studios"] + STUDIOS, key="eco_slate_studio")
+    gen_pick = cols[1].selectbox("Genre", ["All genres"] + GENRES, key="eco_slate_genre")
+    mask = pd.Series(True, index=d.index)
+    if stu_pick != "All studios":
+        mask &= d["studio"] == stu_pick
+    if gen_pick != "All genres":
+        mask &= genre_grp == gen_pick
+    g = d[mask]
+    if len(g) == 0:
+        st.info("No films with budget and box office data match that studio and genre.")
+    else:
+        s = g[["worldwide", "Rentals", "Budget", "P&A", "Home windows", "Streaming", "Theatrical profit",
+               "Full-cycle profit"]].sum() / 1e6
+        slate_rows = [("Worldwide gross", s["worldwide"], "start"),
+                      ("Theaters' share", -(s["worldwide"] - s["Rentals"]), "down"),
+                      ("Production budget", -s["Budget"], "down"), ("Marketing (P&A)", -s["P&A"], "down"),
+                      ("Home windows", s["Home windows"], "up"), ("Streaming / pay TV", s["Streaming"], "up"),
+                      ("Studio profit", s["Full-cycle profit"], "total")]
+        stu_txt = "" if stu_pick == "All studios" else stu_pick
+        gen_txt = "" if gen_pick == "All genres" else gen_pick.lower()
+        name = " ".join(x for x in [stu_txt or "All", gen_txt, "films"] if x)
+        if not stu_txt and gen_txt:
+            name = gen_txt.capitalize() + " films"
+        won = (g["Full-cycle profit"] > 0).mean() * 100
+        verdict = "made" if s["Full-cycle profit"] >= 0 else "lost"
+        show_chart(lambda: waterfall(slate_rows),
+                   f"{name} {verdict} an estimated {money(abs(s['Full-cycle profit']) * 1e6)} in total across "
+                   f"{len(g):,} films; {won:.0f}% of them were profitable",
+                   f"Estimated studio P&L, $M, all matching films added together, under your assumptions "
+                   f"(average {money(g['Full-cycle profit'].mean())} per film, median "
+                   f"{money(g['Full-cycle profit'].median())})")
+        st.caption("*Same bars as the one-film chart above, with every matching film's P&L added together. A total "
+                   "grows with the number of films, so compare slates on the per-film average and median in the "
+                   "subtitle too. The median (the middle film) is usually well below the average, because a few hits "
+                   "earn most of the profit. Genres outside the main eight are grouped as Other.*")
+
     section("Studios & money", "Who's Winning",
             "**How it works:** three views of who is winning and where Universal should put capital: full-slate market "
             "share year by year, which studios' films pay back under your deal terms, and how risk grows with budget. "
