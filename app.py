@@ -1488,35 +1488,68 @@ def script_section():
     with st.expander("What each emotion captures"):
         st.markdown("\n".join(f"- **{e}**: {d}" for e, d in EMOTION_DEFS.items()))
 
-    exhibit("Emotional arcs by genre")
-    c1, c2 = st.columns([1, 2])
+    exhibit("Emotional arcs by genre and studio")
+    ARC_MIN = 5   # an average arc from fewer films is mostly one script's quirks
+    mode = st.radio("Compare", ["Genres", "Studios"], horizontal=True, key="dna_mode",
+                    help="Genres: several genres side by side, optionally within one studio. Studios: several studios "
+                         "side by side, optionally within one genre (e.g. Warner Bros. vs. Universal action films).")
+    c1, c0, c2 = st.columns([1, 1, 2])
     emo = c1.selectbox("Emotion", EMOTIONS, index=EMOTIONS.index("Fear"), key="dna_emo")
-    gs = c2.multiselect("Genres (up to 4)", GENRE_ORDER, default=["Action", "Comedy", "Drama", "Horror"],
-                        max_selections=4, key="dna_genres")
+    gen_of = FILMS["genre"].where(FILMS["genre"].isin(GENRE_ORDER), "Other")
+    if mode == "Genres":
+        fix = c0.selectbox("Studio", ["All studios"] + STUDIOS, key="dna_studio",
+                           help="Pick a studio to see its own films' arcs in each genre.")
+        picks = c2.multiselect("Genres (up to 4)", GENRE_ORDER, default=["Action", "Comedy", "Drama", "Horror"],
+                               max_selections=4, key="dna_genres")
+        pool = FILMS if fix == "All studios" else FILMS[FILMS["studio"] == fix]
+        member = lambda x: pool[gen_of.loc[pool.index] == x]
+        colors = GENRE_COLOR
+        scope = "" if fix == "All studios" else f"{fix} "
+    else:
+        fix = c0.selectbox("Genre", ["All genres"] + GENRE_ORDER, index=1, key="dna_genre_fix",
+                           help="Pick a genre to compare the studios' films in that genre only.")
+        picks = c2.multiselect("Studios (up to 4)", STUDIOS, default=[x for x in ["Universal", "Warner Bros."]
+                                                                      if x in STUDIOS],
+                               max_selections=4, key="dna_studios")
+        pool = FILMS if fix == "All genres" else FILMS[gen_of == fix]
+        member = lambda x: pool[pool["studio"] == x]
+        colors = STUDIO_COLOR
+        scope = "" if fix == "All genres" else f"{fix.lower()} "
+    counts = {x: len(member(x)) for x in picks}
+    shown = [x for x in picks if counts[x] >= ARC_MIN]
+    dropped = [f"{x} ({counts[x]})" for x in picks if counts[x] < ARC_MIN]
+    if dropped:
+        st.info(f"Left out, fewer than {ARC_MIN} films: {', '.join(dropped)}.")
     recs = []
-    for g in gs:
-        a = arc_long(FILMS[FILMS["genre"] == g], emo)
-        a["Series"] = g
+    for x in shown:
+        a = arc_long(member(x), emo)
+        a["Series"] = x
+        a["Films"] = counts[x]
         recs.append(a)
     allf = arc_long(FILMS, emo)
     allf["Series"] = "All films"
+    allf["Films"] = len(FILMS)
     d = pd.concat(recs + [allf], ignore_index=True)
     d["Change"] = d["Share"] - d.groupby("Series")["Share"].transform("first")   # Act 1 comes first
     view = st.radio("Show", ["% of dialogue", "Change from Act 1"], horizontal=True, key="dna_view",
-                    help="Change from Act 1 starts every line at zero, so you see only how each genre builds or fades "
-                         "across the story, not which genre has more of the emotion overall.")
+                    help="Change from Act 1 starts every line at zero, so you see only how each line builds or fades "
+                         "across the story, not which one has more of the emotion overall.")
     change = view == "Change from Act 1"
-    gd = d[d["Series"] != "All films"] if recs else d
-    if change:
-        i = gd["Change"].abs().idxmax()
-        pk = gd.loc[i]
-        title = (f"{pk['Series']} shifts the most in {emo.lower()}: {pk['Change']:+.1f} points by Act {int(pk['Act'])} "
-                 f"vs. Act 1")
+    if mode == "Genres":
+        lab = lambda x: f"{scope}{x.lower()} films" if x != "All films" else "All films"
     else:
-        pk = gd.sort_values("Share", ascending=False).iloc[0]
-        title = (f"{pk['Series']} carries the most {emo.lower()}, peaking in Act {int(pk['Act'])} "
-                 f"({pk['Share']:.1f}% of dialogue)")
-    dom = gs + ["All films"]
+        lab = lambda x: f"{x}'s {scope}films"
+    if not recs:
+        title = f"Only the all-film average to show: pick a broader {'studio' if mode == 'Genres' else 'genre'}"
+    elif change:
+        pk = d.loc[d.loc[d["Series"] != "All films", "Change"].abs().idxmax()]
+        title = (f"{lab(pk['Series']).capitalize() if mode == 'Genres' and not scope else lab(pk['Series'])} shift "
+                 f"the most in {emo.lower()}: {pk['Change']:+.1f} points by Act {int(pk['Act'])} vs. Act 1")
+    else:
+        pk = d[d["Series"] != "All films"].sort_values("Share", ascending=False).iloc[0]
+        title = (f"{lab(pk['Series']).capitalize() if mode == 'Genres' and not scope else lab(pk['Series'])} carry "
+                 f"the most {emo.lower()}, peaking in Act {int(pk['Act'])} ({pk['Share']:.1f}% of dialogue)")
+    dom = shown + ["All films"]
     ycol = "Change" if change else "Share"
     ytitle = (f"Change in % {emo.lower()} since Act 1 (points)" if change
               else f"% of dialogue read as {emo.lower()}")
@@ -1524,25 +1557,28 @@ def script_section():
     def build():
         lines = alt.Chart(d).mark_line(point=line_points(), strokeWidth=2.5).encode(
             x=act_axis(),
-            # zero=False zooms the axis to the data: averaged over hundreds of films the arcs move only a few
+            # zero=False zooms the axis to the data: averaged over many films the arcs move only a few
             # points, which look flat on an axis that starts at 0.
             y=alt.Y(f"{ycol}:Q", title=ytitle, scale=alt.Scale(zero=False, nice=True)),
-            color=alt.Color("Series:N", scale=alt.Scale(domain=dom, range=[GENRE_COLOR[g] for g in gs] + [GRAY]),
+            color=alt.Color("Series:N", scale=alt.Scale(domain=dom, range=[colors[x] for x in shown] + [GRAY]),
                             legend=alt.Legend(orient="top", title=None)),
             strokeDash=alt.condition("datum.Series == 'All films'", alt.value([5, 4]), alt.value([1, 0])),
             tooltip=["Series", "Act", alt.Tooltip("Share:Q", format=".1f", title="% of dialogue"),
-                     alt.Tooltip("Change:Q", format="+.1f", title="Change since Act 1 (pts)")])
+                     alt.Tooltip("Change:Q", format="+.1f", title="Change since Act 1 (pts)"), "Films"])
         if change:
             zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=RULE, strokeDash=[4, 3]).encode(y="y:Q")
             return (zero + lines).properties(height=330)
         return lines.properties(height=330)
+    sub_scope = f", {scope.strip()} films only" if scope else ""
     show_chart(build, title,
-               f"Average change since Act 1 in the share of dialogue read as {emo.lower()}, percentage points" if change
-               else f"Average share of each act's dialogue read as {emo.lower()} (axis zoomed to the data)")
-    st.caption(f"*{emo} = {EMOTION_DEFS[emo]}. Dashed gray = all films. The axis is zoomed in, so read the numbers: "
-               f"averaged over many films, a genre's arc moves only a few points (one film often swings 10+). Genres "
-               f"still have signature shapes; horror's fear builds toward Act 4, comedy's barely moves. A new film "
-               f"that breaks its genre's shape is taking a creative risk.*")
+               (f"Average change since Act 1 in the share of dialogue read as {emo.lower()}, percentage points"
+                if change else f"Average share of each act's dialogue read as {emo.lower()} (axis zoomed to the data)")
+               + sub_scope)
+    st.caption(f"*{emo} = {EMOTION_DEFS[emo]}. Dashed gray = all films from every studio and genre, as a benchmark; "
+               f"hover a line for its film count. The axis is zoomed in, so read the numbers: averaged over many films, "
+               f"an arc moves only a few points (one film often swings 10+). Genres still have signature shapes; "
+               f"horror's fear builds toward Act 4, comedy's barely moves. With small groups (a studio's films in one "
+               f"genre can be a dozen or fewer), a gap of a few points can be one or two unusual scripts.*")
 
     exhibit("Hits vs. misses: where do their scripts differ?")
     c1, c2, c3 = st.columns(3)
