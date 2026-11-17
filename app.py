@@ -1461,8 +1461,8 @@ def hits_vs_misses(studio, genre):
                          "Misses": misses[c].mean() * 100,
                          "Difference": (hits[c].mean() - misses[c].mean()) * 100, "P-value": welch_p(hits[c], misses[c])})
     for c, lab in [("emo_intensity", "Emotional intensity (index)"), ("emo_swing", "Emotional swing across acts (index)"),
-                   ("emo_novelty", "Emotional novelty vs. earlier films (index)"),
-                   ("narr_novelty", "Story novelty vs. earlier films (index)")]:
+                   ("emo_novelty", "Emotional novelty vs. recent films (index)"),
+                   ("narr_novelty", "Story novelty vs. recent films (index)")]:
         rows.append({"Emotion · act": lab, "Hits": hits[c].mean(), "Misses": misses[c].mean(),
                      "Difference": hits[c].mean() - misses[c].mean(), "P-value": welch_p(hits[c], misses[c])})
     diff = pd.DataFrame(rows).sort_values("P-value").head(10)
@@ -1513,9 +1513,24 @@ def _hits_and_novelty(scope, emo2, hm_arcs, diff, novelty):
                "stars, which the Predict tab holds constant.*")
 
     exhibit("Does a fresh script pay off?")
+    st.markdown(
+        "Both measures score how different a script is from the films released in the few years before it, the "
+        "movies audiences had just seen. Higher = more different.\n\n"
+        "- **Emotional novelty: does it *feel* different?** Each script's emotional profile is its mix of the seven "
+        "emotions across the five acts, as on the charts above. The score is how far that mix sits from the mix of "
+        "the recent films. A horror script that's unusually funny, or an action film with an unusually sad last act, "
+        "scores high.\n"
+        "- **Story novelty: is it *about* something different?** Here the model reads what the story is about (its "
+        "characters, settings and events) instead of the emotions. The score is how far the script's language sits "
+        "from the recent films' language. A new world or premise scores high; another heist or superhero origin "
+        "story scores low.\n\n"
+        "The scores have no units, so compare films rather than reading the number. The chart sorts the films into "
+        "five equal groups, from the most familiar fifth to the most novel fifth. The two measures are separate: a "
+        "familiar story can still feel fresh, and the other way around.")
     c1, c2 = st.columns([1, 3])
     nov = c1.radio("Novelty measure", ["Emotional novelty", "Story novelty"], key="dna_nov",
-                   help="How far a film's emotional profile (or its story language) sits from earlier films in the data.")
+                   help="Emotional novelty: how different the script's mix of emotions is from recent films. Story "
+                        "novelty: how different what the story is about is from recent films.")
     col = "emo_novelty" if nov == "Emotional novelty" else "narr_novelty"
     agg = novelty[col]
     if agg is not None:
@@ -1935,10 +1950,12 @@ BUSINESS = {  # feature: (definition, if positive, if negative, lever type)
     "Emotional swing": ("How much the emotional mix shifts from act to act.",
                         "→ Design a clear arc: let the emotional mix change act to act.",
                         "→ Keep the tone more consistent across acts.", "Creative lever"),
-    "Emotional novelty vs. peers": ("How far the film's emotional profile sits from earlier films.",
+    "Emotional novelty vs. peers": ("How different the script's mix of emotions is from films released in the "
+                                    "few years before it.",
                                     "→ Differentiate: an emotional profile unlike recent films goes with better results.",
                                     "→ Audiences here reward the familiar emotional template.", "Creative lever"),
-    "Story novelty vs. peers": ("How far the film's story language sits from earlier films.",
+    "Story novelty vs. peers": ("How different what the story is about (its characters, settings, events) is "
+                                "from films released in the few years before it.",
                                 "→ Fresh stories go with better results here; new IP can pay.",
                                 "→ Familiar stories go with better results here.", "Creative lever"),
 }
