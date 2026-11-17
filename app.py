@@ -1350,7 +1350,8 @@ def fatigue_section():
         return (bars + labels).properties(height=310)
     show_chart(build, title, "Median week-1 to week-2 drop, wide releases, by decade")
     st.caption("*Wide releases only (600+ opening theaters), decades with at least 5 films per group. The drop is week 1 "
-               "to week 2 (7-day grosses), a little gentler than the case's weekend-to-weekend figures. Fans who waited "
+               "to week 2: days 1–7 vs. days 8–14 of the film's wide release (Box Office Mojo), a little gentler than the "
+               "case's weekend-to-weekend figures. Fans who waited "
                "for the sequel show up opening weekend, leaving fewer new viewers for week two.*")
 
     o, fu = FILMS[FILMS["follow_up"] == 0], FILMS[FILMS["follow_up"] == 1]
