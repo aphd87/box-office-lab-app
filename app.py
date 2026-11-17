@@ -1500,23 +1500,49 @@ def script_section():
         recs.append(a)
     allf = arc_long(FILMS, emo)
     allf["Series"] = "All films"
-    d = pd.concat(recs + [allf])
-    peak = d[d["Series"] != "All films"].sort_values("Share", ascending=False).iloc[0] if recs else d.iloc[0]
-    title = (f"{peak['Series']} carries the most {emo.lower()}, peaking in Act {int(peak['Act'])} "
-             f"({peak['Share']:.1f}% of dialogue)")
+    d = pd.concat(recs + [allf], ignore_index=True)
+    d["Change"] = d["Share"] - d.groupby("Series")["Share"].transform("first")   # Act 1 comes first
+    view = st.radio("Show", ["% of dialogue", "Change from Act 1"], horizontal=True, key="dna_view",
+                    help="Change from Act 1 starts every line at zero, so you see only how each genre builds or fades "
+                         "across the story, not which genre has more of the emotion overall.")
+    change = view == "Change from Act 1"
+    gd = d[d["Series"] != "All films"] if recs else d
+    if change:
+        i = gd["Change"].abs().idxmax()
+        pk = gd.loc[i]
+        title = (f"{pk['Series']} shifts the most in {emo.lower()}: {pk['Change']:+.1f} points by Act {int(pk['Act'])} "
+                 f"vs. Act 1")
+    else:
+        pk = gd.sort_values("Share", ascending=False).iloc[0]
+        title = (f"{pk['Series']} carries the most {emo.lower()}, peaking in Act {int(pk['Act'])} "
+                 f"({pk['Share']:.1f}% of dialogue)")
     dom = gs + ["All films"]
+    ycol = "Change" if change else "Share"
+    ytitle = (f"Change in % {emo.lower()} since Act 1 (points)" if change
+              else f"% of dialogue read as {emo.lower()}")
 
     def build():
-        return alt.Chart(d).mark_line(point=line_points(), strokeWidth=2.25).encode(
-            x=act_axis(), y=alt.Y("Share:Q", title=f"% of dialogue read as {emo.lower()}"),
+        lines = alt.Chart(d).mark_line(point=line_points(), strokeWidth=2.5).encode(
+            x=act_axis(),
+            # zero=False zooms the axis to the data: averaged over hundreds of films the arcs move only a few
+            # points, which look flat on an axis that starts at 0.
+            y=alt.Y(f"{ycol}:Q", title=ytitle, scale=alt.Scale(zero=False, nice=True)),
             color=alt.Color("Series:N", scale=alt.Scale(domain=dom, range=[GENRE_COLOR[g] for g in gs] + [GRAY]),
                             legend=alt.Legend(orient="top", title=None)),
             strokeDash=alt.condition("datum.Series == 'All films'", alt.value([5, 4]), alt.value([1, 0])),
-            tooltip=["Series", "Act", alt.Tooltip("Share:Q", format=".1f", title="% of dialogue")]
-        ).properties(height=330)
-    show_chart(build, title, f"Average share of each act's dialogue read as {emo.lower()}")
-    st.caption(f"*{emo} = {EMOTION_DEFS[emo]}. Dashed gray = all films. Genres have signature shapes; a new film that "
-               f"breaks its genre's shape is taking a creative risk.*")
+            tooltip=["Series", "Act", alt.Tooltip("Share:Q", format=".1f", title="% of dialogue"),
+                     alt.Tooltip("Change:Q", format="+.1f", title="Change since Act 1 (pts)")])
+        if change:
+            zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=RULE, strokeDash=[4, 3]).encode(y="y:Q")
+            return (zero + lines).properties(height=330)
+        return lines.properties(height=330)
+    show_chart(build, title,
+               f"Average change since Act 1 in the share of dialogue read as {emo.lower()}, percentage points" if change
+               else f"Average share of each act's dialogue read as {emo.lower()} (axis zoomed to the data)")
+    st.caption(f"*{emo} = {EMOTION_DEFS[emo]}. Dashed gray = all films. The axis is zoomed in, so read the numbers: "
+               f"averaged over many films, a genre's arc moves only a few points (one film often swings 10+). Genres "
+               f"still have signature shapes; horror's fear builds toward Act 4, comedy's barely moves. A new film "
+               f"that breaks its genre's shape is taking a creative risk.*")
 
     exhibit("Hits vs. misses: where do their scripts differ?")
     c1, c2, c3 = st.columns(3)
