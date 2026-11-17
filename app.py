@@ -1440,12 +1440,15 @@ NOVELTY_NAMES = ["1 · Most familiar", "2", "3", "4", "5 · Most novel"]
 
 
 @st.cache_data(show_spinner=False, max_entries=100)
-def hits_vs_misses(scope):
+def hits_vs_misses(studio, genre):
     """Everything in Script DNA that depends only on the film selection (39 t-tests among it), computed once per
     selection for the whole class. Returns hit/miss counts, {emotion: (hit arc, miss arc)}, the top-10 difference
     table and {novelty column: quintile table or None}."""
-    d = FILMS if scope == "All films" else (FILMS[FILMS["studio"] == "Universal"] if scope == "Universal only"
-                                            else FILMS[FILMS["genre"] == scope.split(": ")[1]])
+    d = FILMS
+    if studio != "All studios":
+        d = d[d["studio"] == studio]
+    if genre != "All genres":
+        d = d[d["genre"].where(d["genre"].isin(GENRE_ORDER), "Other") == genre]
     hits, misses = quartile_groups(d)
     if len(hits) < 10:
         return len(hits), len(misses), {}, None, {}
@@ -1476,6 +1479,61 @@ def hits_vs_misses(scope):
         agg["Hit"] *= 100
         novelty[col] = agg
     return len(hits), len(misses), arcs, diff, novelty
+
+
+def _hits_and_novelty(scope, emo2, hm_arcs, diff, novelty):
+    """Hits-vs-misses arc, difference table and the novelty exhibit, for a selection with enough films."""
+    a, b = hm_arcs[emo2]
+    gap = a["Share"] - b["Share"]
+    k = int(gap.abs().idxmax())
+    title = (f"Hits carry {'more' if gap[k] > 0 else 'less'} {emo2.lower()} than misses, most in Act {k + 1} "
+             f"({gap[k]:+.1f} pts)")
+    a["Group"], b["Group"] = "Hits (top 25% return)", "Misses (bottom 25% return)"
+    groups = ["Hits (top 25% return)", "Misses (bottom 25% return)"]
+    arcs = pd.concat([a, b])
+
+    def build():
+        return alt.Chart(arcs).mark_line(point=line_points(), strokeWidth=2.25).encode(
+            x=act_axis(), y=alt.Y("Share:Q", title=f"% of dialogue read as {emo2.lower()}"),
+            color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[GOOD, BAD]),
+                            legend=alt.Legend(orient="top", title=None)),
+            tooltip=["Group", "Act", alt.Tooltip("Share:Q", format=".1f", title="% of dialogue")]
+        ).properties(height=290)
+    show_chart(build, title, f"{scope}: {emo2.lower()} across the five acts, hits vs. misses")
+
+    st.markdown("**The ten biggest script differences between hits and misses**")
+    show_table(diff[["Emotion · act", "Direction", "Hits", "Misses", "Difference", "P-value"]],
+               column_config={"Hits": st.column_config.NumberColumn("Hits (% of dialogue)", format="%.2f"),
+                              "Misses": st.column_config.NumberColumn("Misses (% of dialogue)", format="%.2f"),
+                              "Difference": st.column_config.NumberColumn("Difference (pts)", format="%+.2f"),
+                              "P-value": st.column_config.NumberColumn(format="%.3f")})
+    st.caption("*Ranked by p-value (Welch t-test). Rows marked (index) are scores, not percentages. With 39 comparisons, "
+               "about 4 will reach p < 0.10 by pure chance, so trust a difference more when it is far below 0.10, shows "
+               "up in neighboring acts, or makes story sense. Descriptive only: hits also differ in budget, genre and "
+               "stars, which the Predict tab holds constant.*")
+
+    exhibit("Does a fresh script pay off?")
+    c1, c2 = st.columns([1, 3])
+    nov = c1.radio("Novelty measure", ["Emotional novelty", "Story novelty"], key="dna_nov",
+                   help="How far a film's emotional profile (or its story language) sits from earlier films in the data.")
+    col = "emo_novelty" if nov == "Emotional novelty" else "narr_novelty"
+    agg = novelty[col]
+    if agg is not None:
+        names = NOVELTY_NAMES
+        first, last = agg.set_index("Quintile").loc[names[0], "Return"], agg.set_index("Quintile").loc[names[-1], "Return"]
+        title = f"The most novel fifth returns {last:.2f}× budget vs. {first:.2f}× for the most familiar"
+        def build():
+            bars = alt.Chart(agg).mark_bar(color=BLUE, cornerRadiusEnd=3).encode(
+                x=alt.X("Quintile:N", sort=names, title=None, axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("Return:Q", title="Median return on budget (×)"),
+                tooltip=["Quintile", alt.Tooltip("Return:Q", format=".2f", title="Median return (×)"),
+                         alt.Tooltip("Hit:Q", format=".0f", title=f"Hit rate (%, ≥{HIT_MULTIPLE}×)"), "Films"])
+            return (bars + bars.mark_text(dy=-7, fontSize=11, color=INK).encode(
+                text=alt.Text("Return:Q", format=".2f"))).properties(height=270)
+        with c2:
+            show_chart(build, title, f"{scope}: median return on budget by {nov.lower()} (five equal groups)")
+        st.caption("*A rising pattern means audiences rewarded freshness; a falling one means the familiar template paid. "
+                   "Uses the films selected in 'Hits vs. misses' above.*")
 
 
 @st.fragment
@@ -1581,66 +1639,21 @@ def script_section():
                f"genre can be a dozen or fewer), a gap of a few points can be one or two unusual scripts.*")
 
     exhibit("Hits vs. misses: where do their scripts differ?")
-    c1, c2, c3 = st.columns(3)
-    scope = c1.selectbox("Films", ["All films", "Universal only"] + [f"Genre: {g}" for g in GENRE_ORDER], key="dna_scope")
+    c1, c1b, c2, c3 = st.columns(4)
+    hm_studio = c1.selectbox("Studio", ["All studios"] + STUDIOS, key="dna_hm_studio")
+    hm_genre = c1b.selectbox("Genre", ["All genres"] + GENRES, key="dna_hm_genre")
     emo2 = c2.selectbox("Emotion to plot", EMOTIONS, index=0, key="dna_emo2")
-    n_hits, n_misses, hm_arcs, diff, novelty = hits_vs_misses(scope)
+    n_hits, n_misses, hm_arcs, diff, novelty = hits_vs_misses(hm_studio, hm_genre)
+    scope = " ".join(x for x in [hm_studio if hm_studio != "All studios" else "",
+                                 hm_genre.lower() if hm_genre != "All genres" else "", "films"] if x)
+    scope = "All films" if scope == "films" else scope[0].upper() + scope[1:]
     c3.metric("Films compared", f"{n_hits} hits · {n_misses} misses",
               help="Hits = top 25% of return on budget within the films selected; misses = bottom 25%.")
     if n_hits < 10:
-        st.info("Too few films with a return on budget in this selection. Choose a broader one.")
-        return
-    a, b = hm_arcs[emo2]
-    gap = a["Share"] - b["Share"]
-    k = int(gap.abs().idxmax())
-    title = (f"Hits carry {'more' if gap[k] > 0 else 'less'} {emo2.lower()} than misses, most in Act {k + 1} "
-             f"({gap[k]:+.1f} pts)")
-    a["Group"], b["Group"] = "Hits (top 25% return)", "Misses (bottom 25% return)"
-    groups = ["Hits (top 25% return)", "Misses (bottom 25% return)"]
-    arcs = pd.concat([a, b])
-
-    def build():
-        return alt.Chart(arcs).mark_line(point=line_points(), strokeWidth=2.25).encode(
-            x=act_axis(), y=alt.Y("Share:Q", title=f"% of dialogue read as {emo2.lower()}"),
-            color=alt.Color("Group:N", scale=alt.Scale(domain=groups, range=[GOOD, BAD]),
-                            legend=alt.Legend(orient="top", title=None)),
-            tooltip=["Group", "Act", alt.Tooltip("Share:Q", format=".1f", title="% of dialogue")]
-        ).properties(height=290)
-    show_chart(build, title, f"{scope}: {emo2.lower()} across the five acts, hits vs. misses")
-
-    st.markdown("**The ten biggest script differences between hits and misses**")
-    show_table(diff[["Emotion · act", "Direction", "Hits", "Misses", "Difference", "P-value"]],
-               column_config={"Hits": st.column_config.NumberColumn("Hits (% of dialogue)", format="%.2f"),
-                              "Misses": st.column_config.NumberColumn("Misses (% of dialogue)", format="%.2f"),
-                              "Difference": st.column_config.NumberColumn("Difference (pts)", format="%+.2f"),
-                              "P-value": st.column_config.NumberColumn(format="%.3f")})
-    st.caption("*Ranked by p-value (Welch t-test). Rows marked (index) are scores, not percentages. With 39 comparisons, "
-               "about 4 will reach p < 0.10 by pure chance, so trust a difference more when it is far below 0.10, shows "
-               "up in neighboring acts, or makes story sense. Descriptive only: hits also differ in budget, genre and "
-               "stars, which the Predict tab holds constant.*")
-
-    exhibit("Does a fresh script pay off?")
-    c1, c2 = st.columns([1, 3])
-    nov = c1.radio("Novelty measure", ["Emotional novelty", "Story novelty"], key="dna_nov",
-                   help="How far a film's emotional profile (or its story language) sits from earlier films in the data.")
-    col = "emo_novelty" if nov == "Emotional novelty" else "narr_novelty"
-    agg = novelty[col]
-    if agg is not None:
-        names = NOVELTY_NAMES
-        first, last = agg.set_index("Quintile").loc[names[0], "Return"], agg.set_index("Quintile").loc[names[-1], "Return"]
-        title = f"The most novel fifth returns {last:.2f}× budget vs. {first:.2f}× for the most familiar"
-        def build():
-            bars = alt.Chart(agg).mark_bar(color=BLUE, cornerRadiusEnd=3).encode(
-                x=alt.X("Quintile:N", sort=names, title=None, axis=alt.Axis(labelAngle=0)),
-                y=alt.Y("Return:Q", title="Median return on budget (×)"),
-                tooltip=["Quintile", alt.Tooltip("Return:Q", format=".2f", title="Median return (×)"),
-                         alt.Tooltip("Hit:Q", format=".0f", title=f"Hit rate (%, ≥{HIT_MULTIPLE}×)"), "Films"])
-            return (bars + bars.mark_text(dy=-7, fontSize=11, color=INK).encode(
-                text=alt.Text("Return:Q", format=".2f"))).properties(height=270)
-        with c2:
-            show_chart(build, title, f"{scope}: median return on budget by {nov.lower()} (five equal groups)")
-        st.caption("*A rising pattern means audiences rewarded freshness; a falling one means the familiar template paid. "
-                   "Uses the films selected in 'Hits vs. misses' above.*")
+        st.info("Too few films with a return on budget in this selection (hits and misses need at least 10 films "
+                "each, so about 40 films). Choose a broader studio or genre.")
+    else:
+        _hits_and_novelty(scope, emo2, hm_arcs, diff, novelty)
 
     exhibit("Movie Emotions finder")
     st.markdown("Pick the emotions you want in a new film and see which existing films best match them. Useful for "
