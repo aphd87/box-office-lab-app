@@ -1367,6 +1367,51 @@ def fatigue_section():
              f"greenlight sequels to their biggest hits, so follow-ups start from proven demand ({len(fu)} follow-ups "
              f"vs. {len(o)} originals).")
 
+    exhibit("Do follow-ups burn out faster? By genre and studio")
+    cols = st.columns(2)
+    stu_pick = cols[0].selectbox("Studio", ["All studios"] + STUDIOS, key="fat_studio")
+    gen_pick = cols[1].selectbox("Genre", ["All genres"] + GENRES, key="fat_genre")
+    ws = w[w["drop2"].notna()]
+    if stu_pick != "All studios":
+        ws = ws[ws["studio"] == stu_pick]
+    if gen_pick != "All genres":
+        ws = ws[ws["genre"].where(ws["genre"].isin(GENRE_ORDER), "Other") == gen_pick]
+    sdec = ws.groupby(["decade", "kind"])["drop2"].agg(["median", "count"]).reset_index()
+    sdec = sdec[sdec["count"] >= 3]
+    stu_txt = "" if stu_pick == "All studios" else stu_pick
+    gen_txt = "" if gen_pick == "All genres" else gen_pick.lower()
+    name = " ".join(x for x in [stu_txt, gen_txt] if x) or "all"
+    n_o, n_f = int((ws["kind"] == "Original").sum()), int((ws["kind"] == "Follow-up").sum())
+    if n_o < 3 or n_f < 3 or len(sdec) == 0:
+        st.info(f"Too few wide releases to compare here ({n_f} follow-ups, {n_o} originals). Try a broader pick.")
+    else:
+        m_o = ws.loc[ws["kind"] == "Original", "drop2"].median()
+        m_f = ws.loc[ws["kind"] == "Follow-up", "drop2"].median()
+        verb = "lose more" if m_f > m_o else "lose less"
+        stitle = (f"Across all years, {name} follow-ups {verb} of their audience in week two: "
+                  f"{m_f:.0f}% vs. {m_o:.0f}% for originals ({n_f} follow-ups, {n_o} originals)")
+
+        def sbuild():
+            kinds = ["Original", "Follow-up"]
+            bars = alt.Chart(sdec).mark_bar(stroke="white", strokeWidth=0.8, cornerRadiusEnd=3).encode(
+                x=alt.X("decade:N", title=None, axis=alt.Axis(labelAngle=0)),
+                xOffset=alt.XOffset("kind:N", sort=kinds),
+                y=alt.Y("median:Q", title="Median % of week-1 gross lost in week 2"),
+                color=alt.Color("kind:N", sort=kinds, scale=alt.Scale(domain=kinds, range=[COMPARE, FOCUS]),
+                                legend=alt.Legend(orient="top", title=None)),
+                tooltip=[alt.Tooltip("decade:N", title="Decade"), alt.Tooltip("kind:N", title="Film"),
+                         alt.Tooltip("median:Q", format=".0f", title="Median drop (%)"),
+                         alt.Tooltip("count:Q", title="Films")])
+            labels = bars.mark_text(dy=-7, fontSize=11).encode(text=alt.Text("median:Q", format=".0f"),
+                                                               color=alt.value(INK))
+            return (bars + labels).properties(height=310)
+        show_chart(sbuild, stitle, "Median week-1 to week-2 drop, wide releases, by decade, for your pick")
+    st.caption("*Same chart as the first one in this section, for one studio, one genre, or both. If the blue bar is "
+               "taller than the gray one, follow-ups lost more of their week-1 audience, i.e. burned out faster. A bar "
+               "needs at least 3 films, so a decade can be missing for small picks; with only a handful of films, a gap "
+               "of a few points can be chance. Hover a bar for its film count. Genres outside the main eight are "
+               "grouped as Other.*")
+
     st.markdown("**The steepest week-2 drops among follow-ups since 2000**")
     t = fu[(fu["wide"] == 1) & (fu["year"] >= 2000)].nlargest(12, "drop2")
     show_table(t[["title", "year", "studio", "week1_m", "week2_m", "drop2", "multiple"]], column_config={
